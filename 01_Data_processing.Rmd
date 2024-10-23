@@ -1,0 +1,231 @@
+---
+title: "Data Processing"
+author: "David Martino"
+output: html_document
+---
+
+These codes assumes you've successfully processed fastq files with nf-core methylseq pipeline and downloaded the bedGraph files to the team shared drive (hpc_cepi) into an appropriately named project fold. 
+
+We provide a custom function called read.methyldackel which takes the indivdual bedGraph calles for each sample, and converts them to a bsobj, and combines the samples together in single matrix for use with the bsseq R package. 
+
+Requirements
+------------
+1. Subject metadata: a .csv file called 'Sample_Sheet.csv' and should have a column 'Sample_Name' which is the file name of the methyldackel .bedGraph file output from the nf-core pipeline. Additional subject metaata like 'Study_ID', 'Sex', 'Treatment' etc etc can be appended to the Sample_Name column.
+
+2. TWIST human methylome annotation file which maps all the reads to the human genome version hg38. It has the file extension *hg38_annotated_collapsed.bed" and can be downloaded from the TWIST website [https://www.twistbioscience.com/resources/data-files/twist-human-methylome-panel-target-bed-file]. A copy can also be found in /HPC_CEPI/REFERENCE
+
+Both the Sample_Sheet and the TWIST annotation file should be stored together with the methyldackel calls
+
+# Setup
+## load libraries
+```{r, message=FALSE, warning=FALSE}
+
+library(bsseq)
+library(tidyverse)
+library(minfi)
+library(plyranges)
+library(limma)
+library(annotatr)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(ggpubr)
+library(methylSig)
+library(DSS)
+library(bsseq)
+library(tidyverse)
+library(conflicted)
+
+```
+
+## Specify Directories
+```{r}
+datadir <- ".../hpc_CEPI/ANALYSIS/ProjectName/....should be the location of methyldackel calls stored on the group drive"
+outdir <- ".../hpc_CEPI/ANALYSIS/ProjectName/QCData......the directory where qc data outputs will go"
+metadir <- "../hpc_CEPI/ANALYSIS/ProjectName/Subject_Data......a separate directory where subject information is stored"
+```
+
+# Wrangling methyldackel calls
+## Define the read.methyldackel function
+```{r warning =FALSE, echo=FALSE, message=FALSE}
+#-- read in MethylDackel calls
+read.methyldackel <- function(file) {
+dat <- read.table(
+file,
+skip = 1,
+row.names = NULL,
+col.names = c("chr", "start", "end", "percentage", "meth", "unmeth"),
+colClasses = c("character", "integer", "integer", "integer",
+"integer", "integer"))
+
+## Now create a BS object    
+    BS.obj <- BSseq(
+        pos = dat$start,
+        chr = dat$chr,
+        M   = as.matrix(dat$meth, ncol =1),
+        Cov = as.matrix(dat$meth + dat$unmeth, ncol = 1))
+}
+
+```
+
+## Read files and convert to BSseq object
+```{r warning =FALSE, echo=FALSE, message=FALSE}
+
+#list of methyldackel data files
+file.list <- list.files(file.path(datadir), recursive=TRUE, pattern="*.bedGraph", full=TRUE) 
+NROW(file.list) #sanity check...does the number of files identified match what you expect?
+
+names.list = vector()
+for (i in 1:length(file.list)) { 
+  base = basename(file.list[[i]])
+  base <- gsub('_filtered.markdup.sorted_CpG.bedGraph','',base)
+  print( base ) 
+  names.list <- append(names.list,base)
+  }
+
+library(parallel)
+numCores <- detectCores()
+numCores
+
+#temporary list object of methyldackel calls
+tmp = mclapply(file.list, read.methyldackel, mc.cores = 10)
+
+#Here we apply the sample names to the list object
+for (i in 1:length(tmp)) {
+  sampleNames(tmp[[i]]) <- names.list[i]
+  print(sampleNames(tmp[[i]]))
+}
+
+#Now combine to single BSseq object
+BS.obj <- combineList(tmp, BACKEND = NULL)
+BS.obj <- keepStandardChromosomes(BS.obj, pruning.mode = 'coarse') #pruning off mitochondrial reads and those mapping to non-standard contigs
+
+#print chromosome levels to screen
+seqlevels(BS.obj) #sanity check. Do you have all the expected standard chromosomes?
+
+rownames(BS.obj@colData) = names.list
+```
+
+## Adding subject metadata
+
+The subject metadata can be attached to the BSseq object which is built on the R S4 class and has a slot called 'pData' which metadata can be stored. Before attaching your metadata.csv object to your BS.obj It's really critical to ensure your metadata table is in the same order as your BS.obj otherwise all else downstream is wrong. 
+
+```{r}
+#read subject metadata into your session
+metadata = read.csv(file=file.path(metadir, "metadata.csv"))
+
+#sanity check 1
+head(metadata)
+```
+
+```{r}
+#sanity check 2 - the output should be TRUE. If not check the order of metadata and BS.obj and check the Sample_Name field exactly matches rownames of BS.obj
+all.equal(metadata$Sample_Name, rownames(BS.obj@colData))
+```
+
+```{r}
+#Add metadata to the BS.obj
+pData(BS.obj) <- metadata
+```
+
+# Data QC and QA
+
+## Part1 - CpG level QC
+### Filtering CpGs that are not represented in all samples
+```{r}
+## Number of CpGs which are covered by at least 1 read in all samples
+keep = apply(getCoverage(BS.obj)!=0, 1, all)
+table(keep)
+
+#TOTAL=7936546...change these numbers accordingly
+#TRUE=7731583...change these numbers accordingly
+
+BS.obj <- BS.obj[keep,] #remove marked CpG from the data set
+dim(BS.obj) #7731583....change this number accordingly
+```
+
+
+### Filtering CpG with very low or very high coverage
+```{r warning =FALSE, echo=FALSE, message=FALSE}
+
+BS.obj = methylSig::filter_loci_by_coverage(bs = BS.obj, min_count = 5, max_count = 500) #sets CpGs outside min and max count to zeros in your data set
+keep <- rowSums(getCoverage(BS.obj)) > 0 #logical statement to identify all the zeros
+
+table(keep) #change these numbers for record keeping
+#keep
+#  FALSE    TRUE 
+#  44     7731539  
+
+BS.obj <- BS.obj[keep,] #remove low and high coverage CpG from the data set
+dim(BS.obj) #7731583....change this number accordingly as the current size of the data set
+```
+
+## Part2 - Sample level QC
+
+### DensityPlot of methylated reads
+
+```{r}
+densityPlot(bsseq::getMeth(BS.obj, type = 'raw')) #any failed samples should be obviously different from the rest
+```
+
+### Sex check
+```{r}
+#get sex chromosomes
+chrX = chrSelectBSseq(BS.obj, seqnames = c("chrX"))
+chrY = chrSelectBSseq(BS.obj, seqnames = c("chrY"))
+
+#get the methylated reads on x and y
+x.meth = bsseq::getMeth(chrX, type='raw')
+y.meth = bsseq::getMeth(chrY, type='raw')
+
+#average methylation over x and y
+xMed = colMedians(x.meth)
+yMed = colMedians(y.meth)
+
+#Predict sex based on the difference
+predictedSex <- ifelse(yMed - xMed < 0.25, "F", "M")
+
+#create a data frame for data viz
+df <- as.data.frame(cbind('sample' = colnames(xMed), xMed, yMed))
+df$sex = pData(BS.obj)$sex #here we use the sex assignments in the subject metadata as 
+df$predictedSex <- predictedSex
+```
+
+
+```{r fig.width=6, fig.height=6}
+ggscatter(df, x = 'xMed', y = 'yMed', color = "sex", shape="predictedSex",
+      palette = c("#00AFBB", "#ff69b4"), size=3, alpha=0.5)+
+  ggsci::scale_colour_npg()+
+  labs(title = 'Sex prediction plot', x = "Median intensity chrX", y = "Median intensity chrY") + 
+   theme_bw(base_rect_size = 2, base_size = 20)
+```
+
+### flag discordant sex samples
+```{r}
+#we can use a simple text to numeric conversion, via factorising first, to compare sex concordance
+df$discordant.sex <- as.numeric(factor(df$sex)) != as.numeric(factor(df$predictedSex))
+table(df$discordant.sex)
+```
+
+### Remove any discordant samples (optional)
+```{r}
+to.remove <- which(df$discordant.sex==TRUE)
+BS.obj <- BS.obj[-to.remove,]
+
+dim(BS.obj) #note down the current data set size
+```
+
+
+# Save .rda object and session
+
+This code will save the annotated BS.obj into your output directory which is ready for downstream analysis.
+
+```{r warning =FALSE, echo=FALSE, message=FALSE}
+
+save(BS.obj, metadata, file = file.path(outdir, "BS.obj.rda"))
+sessionInfo()
+
+```
+
+#Session info
+```{r}
+sessionInfo()
+```

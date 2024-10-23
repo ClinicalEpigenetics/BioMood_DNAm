@@ -1,0 +1,130 @@
+---
+title: "Data QC and QA Part 1"
+output: html_notebook
+---
+
+## Specify Directories
+```{r}
+datadir <- '~/file_workspace/Collaborative Projects/HPC_CEPI/ANALYSIS/BioMood_Epi/Data_Processing'
+outdir <- "/mnt/scratch/BioMood"
+metadir <-"~/file_workspace/Collaborative Projects/HPC_CEPI/ANALYSIS/BioMood_Epi/Subject_info" 
+
+```
+
+## load pre-QC Data set
+```{r}
+load(file.path(outdir,"BS.obj.rda"))
+```
+
+
+# Data QC and QA
+
+## Part 1 - CpG level QC
+### Filtering CpGs that are not represented in all samples
+```{r}
+## Number of CpGs which are covered by at least 1 read in all samples
+keep = apply(getCoverage(BS.obj)!=0, 1, all)
+table(keep)
+
+#TOTAL= 8507560
+#TRUE=7750706
+
+BS.obj <- BS.obj[keep,] #keep marked CpG from the data set
+dim(BS.obj) #7750706, 52
+```
+
+
+### Filtering CpG with very low or very high coverage
+```{r warning =FALSE, echo=FALSE, message=FALSE}
+
+to.remove.low <- which(bsseq::getCoverage(BS.obj, type = "Cov") < 5) #remove low and high coverage CpG from the data set
+
+BS.obj <- BS.obj[-to.remove.low ,] #remove low and high coverage CpG from the data set
+
+to.remove.high <- which(bsseq::getCoverage(BS.obj, type = "Cov") > 500) #remove high coverage CpG from the data set
+
+BS.obj <- BS.obj[-to.remove.high ,] #remove high coverage CpG from the data set
+
+dim(BS.obj) #7719881 
+
+```
+
+```{r}
+save(BS.obj, file = file.path(outdir, "BS.obj.QC_QA.rda"))
+sessionInfo()
+```
+
+
+
+
+
+## Part 2 - Sample level QC
+
+### DensityPlot of methylated reads
+
+```{r}
+densityPlot(bsseq::getMeth(BS.obj, type = 'raw')) #any failed samples should be obviously different from the rest
+```
+
+### Sex check
+```{r}
+#get sex chromosomes
+chrX = chrSelectBSseq(BS.obj, seqnames = c("chrX"))
+chrY = chrSelectBSseq(BS.obj, seqnames = c("chrY"))
+
+#get the methylated reads on x and y
+x.meth = bsseq::getMeth(chrX, type='raw')
+y.meth = bsseq::getMeth(chrY, type='raw')
+
+#average methylation over x and y
+xMed = colMedians(x.meth)
+yMed = colMedians(y.meth)
+
+#Predict sex based on the difference
+predictedSex <- ifelse(yMed - xMed < 0.25, "F", "M")
+
+#create a data frame for data viz
+df <- as.data.frame(cbind('sample' = colnames(xMed), xMed, yMed))
+df$sex = pData(BS.obj)$sex #here we use the sex assignments in the subject metadata as 
+df$predictedSex <- predictedSex
+```
+
+
+```{r fig.width=6, fig.height=6}
+ggscatter(df, x = 'xMed', y = 'yMed', color = "sex", shape="predictedSex",
+      palette = c("#00AFBB", "#ff69b4"), size=3, alpha=0.5)+
+  ggsci::scale_colour_npg()+
+  labs(title = 'Sex prediction plot', x = "Median intensity chrX", y = "Median intensity chrY") + 
+   theme_bw(base_rect_size = 2, base_size = 20)
+```
+
+### flag discordant sex samples
+```{r}
+#we can use a simple text to numeric conversion, via factorising first, to compare sex concordance
+df$discordant.sex <- as.numeric(factor(df$sex)) != as.numeric(factor(df$predictedSex))
+table(df$discordant.sex)
+```
+
+### Remove any discordant samples (optional)
+```{r}
+to.remove <- which(df$discordant.sex==TRUE)
+BS.obj <- BS.obj[-to.remove,]
+
+dim(BS.obj) #note down the current data set size
+```
+
+
+# Save .rda object and session
+
+This code will save the annotated BS.obj into your output directory which is ready for downstream analysis.
+
+```{r warning =FALSE, echo=FALSE, message=FALSE}
+
+save(BS.obj, metadata, file = file.path(outdir, "BS.obj.rda"))
+sessionInfo()
+
+```
+
+#Session info
+```{r}
+sessionInfo()

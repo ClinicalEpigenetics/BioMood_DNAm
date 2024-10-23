@@ -1,0 +1,844 @@
+---
+title: "Hypothesis Testing"
+output: html_notebook
+---
+
+```{r}
+## Libraries 
+library(minfi)
+library(ggplot2)
+library(ggsci)
+library(tidyverse)
+library(ggpubr)
+library(limma)
+library(dplyr)
+library(DMRcate)
+library(regioneR)
+library(gridExtra)
+library(grid)
+library(ggrepel)
+```
+
+
+## Derive Beta and M vals
+```{r}
+load(file.path(outdir,"BS.obj.rda"))
+
+#Beta values are calculated as the ratio of methylated / total reads. M-values are the log2 transform of Betas.
+
+#Extract methylation ratios
+Beta <-  bsseq::getMeth(BS.obj_quality, type='raw') %>%
+  as.matrix() %>% round(2)
+
+colnames(Beta) = rownames(BS.obj_quality@colData)
+
+#Derive M values
+meth.cov <- bsseq::getCoverage(BS.obj_quality, type='M')
+unmeth.cov <- bsseq::getCoverage(BS.obj_quality) - meth.cov
+
+M <- log2((meth.cov + 2) /(unmeth.cov + 2)) %>%
+  as.matrix() %>% round(2)
+
+features <- as.data.frame(BS.obj_quality@rowRanges)
+
+rownames(Beta) = paste(features$seqnames,features$start,sep=":")
+rownames(M) = paste(features$seqnames,features$start,sep=":")
+
+save(Beta, M, metadata, file = file.path(outdir, "M_values.rda"))
+load(file.path(outdir, "Robj/Robj/M_values.rd"))
+```
+
+
+
+## Adding top 5 principle components to metadata
+```{r}
+#principle components
+Beta <-  bsseq::getMeth(BS.obj_quality, type='raw') %>%
+  as.matrix() %>% round(2)
+
+#Principal components 
+pc <- prcomp(t(Beta), center = TRUE, scale = F,retx=TRUE)
+```
+
+```{r}
+#Modifying metadata for hypothesis testing
+metadata_ht <- metadata_quality %>%
+  dplyr::mutate(RowNumber = row_number()) %>%
+  dplyr::select(RowNumber, BioMood.ID, BioMood.group, capture)
+```
+
+```{r}
+#merging principle components to metadata
+pca = pc$x %>%
+  as_tibble(rownames = 'RowNumber')
+
+pca$RowNumber = as.integer(pca$RowNumber)
+
+metadata_ht = pca %>%
+  dplyr::select('RowNumber', PC1, PC2, PC3, PC4, PC5) %>%
+  dplyr::left_join(metadata_ht)
+
+```
+
+#Adding new metadata to BS object
+```{r}
+pData(BS.obj_quality) <- metadata_ht
+```
+
+
+## Set up model design matrix
+```{r}
+library(edgeR)
+
+#Hypothesis testing
+
+#model definition
+design <- model.matrix(~as.factor(BioMood.group) +
+                        PC1+
+                        PC2+
+                        PC3+
+                        PC4,
+                       metadata_ht)
+
+design_unadjusted <- model.matrix(~as.factor(BioMood.group),
+                       metadata_ht)
+
+```
+
+
+#Fitting model
+```{r}
+#fit M vals
+M.fit <- lmFit(M, design)
+#fit B vals
+B.fit <- lmFit(Beta, design)
+
+#fit contrasts
+
+M.fit2 <- eBayes(M.fit)
+
+#fit contrasts
+B.fit2 <- eBayes(B.fit)
+
+summary(decideTests(M.fit2))
+
+
+#Clean up memory
+rm(BS.obj_quality, M.fit, B.fit, diff_fit, features, unmeth.cov, pca, pca.raw, meth.cov, M, Beta, Btt)
+```
+
+```{r}
+## TWIST targeted Differentially Methylated CpGs: Diet Condition ##
+
+Mtt <- topTable(M.fit2, coef = 'as.factor(BioMood.group)1', number = Inf, sort.by = 'none')
+
+Btt <- topTable(B.fit2, coef = 'as.factor(BioMood.group)1', number = Inf, sort.by = 'none')
+
+save(Mtt, Btt, file = file.path(outdir, "Top_table.rda"))
+
+```
+
+#Manhattan plot of CpGs associated with Diet
+```{r}
+#Loading necessary libraries
+library(ggmanh)
+library(SeqArray)
+
+
+#Creating data frame suitable for plot
+chromosome <- gsub(":.*", "", rownames(Mtt[1:7719881,]))
+
+position <- gsub(".*:", "", rownames(Mtt[1:7719881,]))
+
+simdata <- data.frame(
+  "chromosome" = chromosome,
+  "position" = as.numeric(position),
+  "P.value" = Mtt$P.Value
+)
+
+simdata$chromosome <- factor(simdata$chromosome, c(1:22,"X"))
+
+#Plotting
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhatten plot with unadjusted P.Values", y.label = "P values")
+g
+
+
+## Highlighted Manhattan plot with interesting regions and candidate genes ##
+
+# Highlighting by Interesting regions and significance
+
+i <- (simdata$chromosome == '19') & grepl("^1331", as.character(simdata$position)) |(simdata$chromosome == '18') & grepl("^744", as.character(simdata$position)) | (simdata$P.value < 1e-5)
+
+
+# Highlighting by Candidate genes from Arpon et al.
+
+#EEF2 = chr19:3,976,552-3,985,378
+#RUNX3 = chr1:25,226,002-25,291,501 (62,450bp) (1291 CpGs)
+#IL4I1 = chr19:50,392,927-50,404,974
+#MAPKAPK2 = chr1:206,858,575-206,906,063
+#COL18A1 = Chr21:46825080-46933634 (2938 CpGs)
+#LEPR = Chr1:65886335-66107242 (372 CpGs)
+#PLAGL1 = Chr6:144261437-144286615 (96 CpGs)
+#IFRD1 = chr7:112,063,229-112,117,258 (361 CpGs)
+#PPARGC1B = chr5:149,109,873-149,234,585 (624 CpGs)
+
+
+# Extract row names
+row_names <- rownames(Mtt)
+
+# Use gsub to extract the numeric part after "19:"
+numeric_part19 <- as.numeric(gsub("^19:", "", row_names))
+
+numeric_part1 <- as.numeric(gsub("^1:", "", row_names))
+
+numeric_part21 <- as.numeric(gsub("^21:", "", row_names))
+
+numeric_part5 <- as.numeric(gsub("^5:", "", row_names))
+
+numeric_part6 <- as.numeric(gsub("^6:", "", row_names))
+
+numeric_part7 <- as.numeric(gsub("^7:", "", row_names))
+
+# Find the rownames within gene coding region
+IL4I1 <- which(numeric_part19 >= 50392927 & numeric_part19 <= 50404974)
+EEF2 <- which(numeric_part19 >= 3976552 & numeric_part19 <= 3985378)
+RUNX3 <- which(numeric_part1 >= 25226002 & numeric_part1 <= 25291501)
+MAPKAPK2 <- which(numeric_part1 >= 206858575 & numeric_part1 <= 206906063)
+COL18A1 <- which(numeric_part21 >= 46825080 & numeric_part21 <= 46933634)
+LEPR <- which(numeric_part1 >= 65886335 & numeric_part1 <= 66107242 )
+PLAGL1 <- which(numeric_part6 >= 144261437 & numeric_part6 <= 144286615 )
+IFRD1 <- which(numeric_part7 >= 112063229 & numeric_part7 <= 112117258)
+PPARGC1B <- which(numeric_part5 >= 149109873 & numeric_part5 <= 149234585 )
+
+x <- (simdata$chromosome == '21') & grepl("^468|^4690|^4691|^4692|^4693", as.character(simdata$position)) |(simdata$chromosome == '5') & grepl("^14910|^14911|^14912|^14913|^14914|^14915|^14916|^14917|^14918|^14919|^14920|^14921|^14922", as.character(simdata$position)) & !grepl("^14915664|^14915862|^14927|^14928|^1491361|^1491270|^14926|^14928", as.character(simdata$position))
+
+#Coloring data frame by specified CpGs
+simdata$color <- "Not Significant"
+simdata$color[i] <- "Significant"
+simdata$color[x] <- "candidate"
+
+highlight_colormap <- c("Not Significant" = "grey", "Significant" = "darkblue", "candidate" = "darkviolet")
+
+#Labelling data frame by specified CpGs
+simdata$label <- ""
+
+COL <- (simdata$chromosome == '21') & (simdata$P.value < 5e-5) & grepl("^468|^4690|^4691|^4692|^4693", as.character(simdata$position))
+simdata$label[COL] <- paste("COL18A1")
+
+PPAR <- (simdata$chromosome == '5') & (simdata$P.value < 5e-5) & grepl("^149109910", as.character(simdata$position))
+simdata$label[PPAR] <- paste("PPARGC1B")
+
+
+#Manhattan plot of whole-genome
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhatten plot with unadjusted P.Values", y.label = "P values", highlight.colname = "color", highlight.col = highlight_colormap, color.by.highlight = TRUE, label.colname = "label", force = 20)
+g
+
+#Manhattan plot COL18A1 - Chromosome 21 
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chromosome = "21", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhattan plot COL18A1", y.label = "P values", x.label = "Chromosome 21", highlight.colname = "color", highlight.col = highlight_colormap, color.by.highlight = TRUE, label.colname = "label", force = 20, signif = c(1.7e-05),)
+g
+
+#Manhattan plot PPARGC1B - Chromosome 5
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chromosome = "5", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhattan plot PPARGC1B", y.label = "P values", x.label = "Chromosome 5", highlight.colname = "color", highlight.col = highlight_colormap, color.by.highlight = TRUE, label.colname = "label", force = 20, signif = c(8.0e-05))
+g
+
+pdf(file=paste0(outdir,sep="/","plots/manhatten.pdf"), width=10)
+
+dev.off()
+```
+
+## Adding glycA and glycB levels to metadata
+```{r}
+library(readr)
+BIOMOOD_GLYCSPC <- read_csv("~/file_workspace/Collaborative Projects/HPC_CEPI/ANALYSIS/BioMood_Epi/Subject_info/BIOMOOD_GLYCSPC_260824.csv")
+View(BIOMOOD_GLYCSPC)
+
+# Removing samples of poor sequencing quality
+samples_to_remove <- c("BioMood24", "BioMood35", "BioMood50", "BioMood39")
+
+# Creating data frame with quality samples and data from specific time points
+filtered_df <- BIOMOOD_GLYCSPC %>%
+  filter((sampleTimePoint == 36) | (sourceID == "BioMood9" & sampleTimePoint == 28)|(sourceID == "BioMood48"  & sampleTimePoint == 20)|(sourceID == "BioMood52"  & sampleTimePoint == 20)) %>%
+  filter(!sourceID %in% samples_to_remove)
+```
+
+```{r}
+#Modifying metadata for hypothesis testing - removing BioMood16 and selecting relevant columns
+metadata_ht2 <- metadata_ht %>%
+  dplyr::select(BioMood.ID, BioMood.group, capture, PC1, PC2, PC3, PC4, PC5) %>%
+  filter(!BioMood.ID == c("BioMood16"))
+```
+
+```{r}
+#Merging glyc data to metadata
+GLYCSPC = filtered_df
+
+colnames(GLYCSPC)[colnames(GLYCSPC) == "sourceID"] <- "BioMood.ID"
+
+metadata_ht2 = GLYCSPC %>%
+  dplyr::select('BioMood.ID', sampleTimePoint, GlycA, GlycB, SPC1, SPC2, SPC3) %>%
+  dplyr::left_join(metadata_ht2)
+
+```
+
+#Adding new metadata to BS object
+```{r}
+
+# Remove mismatched sample from BS object.
+id.mis <- grep("A7-BioMood16", metadata_quality$Sample_Name) #get the locations of sample missing from glyc dataset
+
+metadata_gly <- metadata_quality[-id.mis,] #remove from metadata table
+BS.obj_gly <- BS.obj_quality[,-id.mis]    #remove from sequencing data
+
+# Adding metadata to new BS object
+pData(BS.obj_gly) <- metadata_ht2
+
+save(BS.obj_gly, metadata_gly, file = file.path(outdir, "BS.obj_gly.rda"))
+```
+
+## Derive new Beta and M vals with new BS obj
+```{r}
+load(file.path(outdir,"BS.obj.rda"))
+
+#Beta values are calculated as the ratio of methylated / total reads. M-values are the log2 transform of Betas.
+
+#extract methylation ratios
+Beta <-  bsseq::getMeth(BS.obj_gly, type='raw') %>%
+  as.matrix() %>% round(2)
+
+colnames(Beta) = rownames(BS.obj_gly@colData)
+
+#Derive M values
+meth.cov <- bsseq::getCoverage(BS.obj_gly, type='M')
+unmeth.cov <- bsseq::getCoverage(BS.obj_gly) - meth.cov
+
+M <- log2((meth.cov + 2) /(unmeth.cov + 2)) %>%
+  as.matrix() %>% round(2)
+
+features <- as.data.frame(BS.obj_gly@rowRanges)
+
+rownames(Beta) = paste(features$seqnames,features$start,sep=":")
+rownames(M) = paste(features$seqnames,features$start,sep=":")
+
+save(Beta, M, metadata_ht2, file = file.path(outdir, "M_values_Gly.rda"))
+
+```
+
+## Set up model design matrix for GlycA 
+```{r}
+library(edgeR)
+
+#Hypothesis testing
+
+#model definition
+design <- model.matrix(~GlycA + 
+                        as.factor(BioMood.group) +
+                        PC1+
+                        PC2+
+                        PC3+
+                        PC4,
+                       metadata_ht2)
+
+design_unadjusted <- model.matrix(~GlycA,
+                       metadata_ht2)
+
+```
+
+
+```{r}
+#fit M vals
+M.fit <- lmFit(M, design)
+#fit B vals
+B.fit <- lmFit(Beta, design)
+
+#fit contrasts
+
+M.fit2 <- eBayes(M.fit)
+
+#fit contrasts
+B.fit2 <- eBayes(B.fit)
+
+summary(decideTests(M.fit2))
+
+
+#Clean up memory
+rm(BS.obj_quality, M.fit, B.fit, M, Beta, BS.obj_gly)
+```
+
+
+```{r}
+## TWIST targeted differentiall metyhlated CpGs: Metabolite Condition
+
+Mtt <- topTable(M.fit2, coef = 'GlycA', number = Inf, sort.by = 'none')
+
+Btt <- topTable(B.fit2, coef = 'GlycA', number = Inf, sort.by = 'none')
+
+save(Mtt, Btt, file = file.path(outdir, "Top_table_glyA.rda"))
+```
+
+
+#Manhattan plot of CpGs associated with metabolite GlycA
+```{r}
+library(ggmanh)
+library(SeqArray)
+
+chromosome <- gsub(":.*", "", rownames(Mtt[1:7719699,]))
+
+position <- gsub(".*:", "", rownames(Mtt[1:7719699,]))
+
+simdata <- data.frame(
+  "chromosome" = chromosome,
+  "position" = as.numeric(position),
+  "P.value" = Mtt$P.Value[1:7719699]
+)
+
+simdata$chromosome <- factor(simdata$chromosome, c(1:22,"X"))
+
+simdata$label <- ""
+x <- (simdata$chromosome == '14') & (simdata$P.value < 5e-7)
+simdata$label[x] <- paste("DDHD1, BMP4, MIR5580")
+
+
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhatten plot GlycA with unadjusted P.Values", y.label = "P values", label.colname = "label")
+g
+
+pdf(file=paste0(outdir,sep="/","plots/manhatten_GlycA.pdf"), width=10)
+
+dev.off()
+```
+
+```{r}
+## Highlighted Manhattan plot ##
+x <- (simdata$chromosome == '1') & grepl("^2303", as.character(simdata$position)) |(simdata$chromosome == '13') & grepl("^81229", as.character(simdata$position))  |(simdata$chromosome == '21') & grepl("^4771", as.character(simdata$position))|(simdata$chromosome == '14') & grepl("^54202", as.character(simdata$position)) 
+
+i <- (simdata$P.value < 1e-5)
+
+
+simdata$color <- ""
+simdata$color <- "Not Significant"
+simdata$color[i] <- "Significant"
+simdata$color[x] <- "interesting"
+
+
+simdata$label <- ""
+LINC <- (simdata$chromosome == '14') & (simdata$P.value < 5e-7) & grepl("^54202884", as.character(simdata$position))
+simdata$label[LINC] <- paste("LINC02331")
+Inter <- (simdata$chromosome == '13') & grepl("^81229074", as.character(simdata$position))
+simdata$label[Inter] <- paste("Intergenic")
+
+highlight_colormap <- c("Not Significant" = "grey", "Significant" = "darkblue", "interesting" = "darkviolet")
+
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhatten plot GlycA with unadjusted P.Values", y.label = "P values", , highlight.colname = "color", highlight.col = highlight_colormap, color.by.highlight = TRUE, label.colname = "label", force = 5)
+g
+
+
+pdf(file=paste0(outdir,sep="/","plots/manhatten_glyA_highlighted.pdf"), width=10)
+
+dev.off()
+```
+
+
+## Set up model design matrix for GlycB
+```{r}
+library(edgeR)
+
+#Hypothesis testing
+
+#model definition
+design <- model.matrix(~GlycB + as.factor(BioMood.group) +
+                        PC1+
+                        PC2+
+                        PC3+
+                        PC4,
+                       metadata_ht2)
+
+design_unadjusted <- model.matrix(~GlycB,
+                       metadata_ht2)
+
+```
+
+
+```{r}
+#fit M vals
+M.fit <- lmFit(M, design)
+#fit B vals
+B.fit <- lmFit(Beta, design)
+
+#fit contrasts
+
+M.fit2 <- eBayes(M.fit)
+
+#fit contrasts
+B.fit2 <- eBayes(B.fit)
+
+summary(decideTests(M.fit2))
+
+
+#Clean up memory
+rm(M.fit, B.fit, M, Beta)
+```
+
+
+```{r}
+## TWIST targeted differentially methylated CpGs: Metabolite Condition
+
+Mtt <- topTable(M.fit2, coef = 'GlycB', number = Inf, sort.by = 'none')
+
+Btt <- topTable(B.fit2, coef = 'GlycB', number = Inf, sort.by = 'none')
+
+save(Mtt, Btt, file = file.path(outdir, "Top_table_glyB.rda"))
+```
+
+```{r}
+library(ggmanh)
+library(SeqArray)
+
+chromosome <- gsub(":.*", "", rownames(Mtt[1:7719699,]))
+
+position <- gsub(".*:", "", rownames(Mtt[1:7719699,]))
+
+simdata <- data.frame(
+  "chromosome" = chromosome,
+  "position" = as.numeric(position),
+  "P.value" = Mtt$P.Value[1:7719699]
+)
+
+simdata$chromosome <- factor(simdata$chromosome, c(1:22,"X"))
+
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhatten plot GlycB with unadjusted P.Values", y.label = "P values")
+g
+
+## Highlighted Manhattan plot ##
+x <- (simdata$chromosome == '1') & grepl("^2303", as.character(simdata$position)) |(simdata$chromosome == '13') & grepl("^81229", as.character(simdata$position))  |(simdata$chromosome == '21') & grepl("^4771", as.character(simdata$position))|(simdata$chromosome == '14') & grepl("^54202", as.character(simdata$position)) 
+
+i <- (simdata$P.value < 1e-5)
+
+
+simdata$color <- ""
+simdata$color <- "Not Significant"
+simdata$color[i] <- "Significant"
+simdata$color[x] <- "interesting"
+
+highlight_colormap <- c("Not Significant" = "grey", "Significant" = "darkblue", "interesting" = "darkviolet")
+
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhatten plot GlycB with unadjusted P.Values", y.label = "P values", , highlight.colname = "color", highlight.col = highlight_colormap, color.by.highlight = TRUE, label.colname = "label", force = 5)
+g
+
+
+pdf(file=paste0(outdir,sep="/","plots/manhatten_GlycB.pdf"), width=10)
+
+dev.off()
+```
+
+```{r}
+## Set up model design matrix for GlycB adjusted for GlycA
+
+library(edgeR)
+
+#Hypothesis testing
+
+#model definition
+design <- model.matrix(~GlycB + as.factor(BioMood.group) + GlycA +
+                        PC1+
+                        PC2+
+                        PC3+
+                        PC4,
+                       metadata_ht2)
+
+#fit M vals
+M.fit <- lmFit(M, design)
+#fit B vals
+B.fit <- lmFit(Beta, design)
+
+#fit contrasts
+M.fit2 <- eBayes(M.fit)
+
+#fit contrasts
+B.fit2 <- eBayes(B.fit)
+
+summary(decideTests(M.fit2))
+
+#Clean up memory
+rm(M.fit, B.fit, M, Beta)
+
+## TWIST targeted CpGs
+
+Mtt <- topTable(M.fit2, coef = 'GlycB', number = Inf, sort.by = 'none')
+
+Btt <- topTable(B.fit2, coef = 'GlycB', number = Inf, sort.by = 'none')
+
+
+chromosome <- gsub(":.*", "", rownames(Mtt[1:7719699,]))
+
+position <- gsub(".*:", "", rownames(Mtt[1:7719699,]))
+
+simdata <- data.frame(
+  "chromosome" = chromosome,
+  "position" = as.numeric(position),
+  "P.value" = Mtt$P.Value[1:7719699]
+)
+
+simdata$chromosome <- factor(simdata$chromosome, c(1:22,"X"))
+
+simdata$label <- ""
+i <- (simdata$chromosome == '8') & (simdata$P.value < 5e-7)
+simdata$label[i] <- paste("Chromosome 8 label", 1:sum(i))
+
+
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhatten plot GlycB adj GlycA with unadjusted P.Values", y.label = "P values", label.colname = "label")
+g
+```
+
+
+```{r}
+## Set up model design matrix for GlycA adjusted for GlycB
+
+library(edgeR)
+
+#Hypothesis testing
+
+#model definition
+design <- model.matrix(~GlycA + as.factor(BioMood.group) + GlycB +
+                        PC1+
+                        PC2+
+                        PC3+
+                        PC4,
+                       metadata_ht2)
+
+#fit M vals
+M.fit <- lmFit(M, design)
+#fit B vals
+B.fit <- lmFit(Beta, design)
+
+#fit contrasts
+
+M.fit2 <- eBayes(M.fit)
+
+#fit contrasts
+B.fit2 <- eBayes(B.fit)
+
+summary(decideTests(M.fit2))
+
+
+#Clean up memory
+rm(M.fit, B.fit, M, Beta)
+
+## TWIST targeted CpGs
+
+Mtt <- topTable(M.fit2, coef = 'GlycA', number = Inf, sort.by = 'none')
+
+Btt <- topTable(B.fit2, coef = 'GlycA', number = Inf, sort.by = 'none')
+
+)
+
+
+
+#Manhatten plot
+chromosome <- gsub(":.*", "", rownames(Mtt[1:7719699,]))
+
+position <- gsub(".*:", "", rownames(Mtt[1:7719699,]))
+
+simdata <- data.frame(
+  "chromosome" = chromosome,
+  "position" = as.numeric(position),
+  "P.value" = Mtt$P.Value[1:7719699]
+)
+
+simdata$chromosome <- factor(simdata$chromosome, c(1:22,"X"))
+
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhatten plot GlycA adj glycB with unadjusted P.Values", y.label = "P values", label.colname = "label", force = 5)
+g
+
+
+
+###Highlighted Manhatten plot
+i <- (simdata$chromosome == '14') & grepl("^10014", as.character(simdata$position))
+
+simdata$color <- "Not Significant"
+simdata$color[i] <- "Significant"
+
+highlight_colormap <- c("Not Significant" = "grey", "Significant" = "darkblue")
+
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhatten plot GlycB with unadjusted P.Values", y.label = "P values", , highlight.colname = "color", highlight.col = highlight_colormap, color.by.highlight = TRUE, label.colname = "label", force = 5)
+g
+
+```
+
+
+```{r}
+## Set up model design matrix for SPC3
+
+library(edgeR)
+
+#Hypothesis testing
+
+#model definition
+design <- model.matrix(~SPC3 + as.factor(BioMood.group) +
+                        PC1 +
+                        PC2 +
+                        PC3 +
+                        PC4,
+                       metadata_ht2)
+
+#fit M vals
+M.fit <- lmFit(M, design)
+#fit B vals
+B.fit <- lmFit(Beta, design)
+
+#fit contrasts
+
+M.fit2 <- eBayes(M.fit)
+
+#fit contrasts
+B.fit2 <- eBayes(B.fit)
+
+summary(decideTests(M.fit2))
+
+
+#Clean up memory
+rm(M.fit, B.fit, M, Beta)
+```
+
+```{r}
+## TWIST targeted DMP Finder: SPC3
+
+Mtt <- topTable(M.fit2, coef = 'SPC3', number = Inf, sort.by = 'none')
+
+Btt <- topTable(B.fit2, coef = 'SPC3', number = Inf, sort.by = 'none')
+
+save(Mtt, Btt, file = file.path(outdir, "Top_table_SPC3.rda"))
+```
+
+```{r}
+## Manhattan plot ##
+chromosome <- gsub(":.*", "", rownames(Mtt[1:7719699,]))
+
+position <- gsub(".*:", "", rownames(Mtt[1:7719699,]))
+
+simdata <- data.frame(
+  "chromosome" = chromosome,
+  "position" = as.numeric(position),
+  "P.value" = Mtt$P.Value[1:7719699]
+)
+
+simdata$chromosome <- factor(simdata$chromosome, c(1:22,"X"))
+
+simdata$label <- ""
+i <- simdata$P.value < 5e-7
+simdata$label[i] <- paste("< 5e-7", 1:sum(i))
+
+
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhatten plot SPC3 adj SPC2 with unadjusted P.Values", y.label = "P values", label.colname = "label", force = 5)
+g
+
+
+
+###Highlighted Manhattan plot
+i <- (simdata$P.value < 1e-5)
+
+x <- (simdata$chromosome == '16') & grepl("^885", as.character(simdata$position)) | (simdata$chromosome == '6') & grepl("^1693", as.character(simdata$position)) | (simdata$chromosome == '16') & grepl("^2138", as.character(simdata$position))
+
+simdata$label <- ""
+c <- (simdata$chromosome == '16') & grepl("^8856", as.character(simdata$position)) & (simdata$P.value < 1e-5)
+a <- (simdata$chromosome == '6') & grepl("^1693", as.character(simdata$position)) & (simdata$P.value < 1e-5)
+b <- (simdata$chromosome == '16') & grepl("^2138", as.character(simdata$position)) & (simdata$P.value < 5e-8)
+
+simdata$label[c] <- paste("ZFPM1")
+simdata$label[a] <- paste("Intergenic")
+simdata$label[b] <- paste("TSC2")
+
+
+simdata$color <- "Not Significant"
+simdata$color[i] <- "Significant"
+simdata$color[x] <- "interesting"
+
+highlight_colormap <- c("Not Significant" = "grey", "Significant" = "darkblue", "interesting" = "darkviolet")
+
+g <- manhattan_plot(x = simdata, pval.colname = "P.value", chr.colname = "chromosome", pos.colname = "position", plot.title = "Manhatten plot SPC3 adj SPC2 with unadjusted P.Values", y.label = "P values", , highlight.colname = "color", highlight.col = highlight_colormap, color.by.highlight = TRUE, label.colname = "label", force = 10)
+g
+```
+
+
+
+## Set up model design matrix for SPC1
+```{r}
+library(edgeR)
+
+#Hypothesis testing
+
+#model definition
+design <- model.matrix(~SPC1 + as.factor(BioMood.group) +
+                        PC1 +
+                        PC2 +
+                        PC3 +
+                        PC4,
+                       metadata_ht2)
+
+#fit M vals
+M.fit <- lmFit(M, design)
+#fit B vals
+B.fit <- lmFit(Beta, design)
+
+#fit contrasts
+
+M.fit2 <- eBayes(M.fit)
+
+#fit contrasts
+B.fit2 <- eBayes(B.fit)
+
+summary(decideTests(M.fit2))
+```
+
+```{r}
+## TWIST targeted DMP Finder: SPC1
+
+Mtt <- topTable(M.fit2, coef = 'SPC1', number = Inf, sort.by = 'none')
+
+Btt <- topTable(B.fit2, coef = 'SPC1', number = Inf, sort.by = 'none')
+
+save(Mtt, Btt, file = file.path(outdir, "Top_table_SPC1.rda"))
+```
+
+
+## Set up model design matrix for SPC2
+```{r}
+library(edgeR)
+
+#Hypothesis testing
+
+#model definition
+design <- model.matrix(~SPC2 + as.factor(BioMood.group) +
+                        PC1 +
+                        PC2 +
+                        PC3 +
+                        PC4,
+                       metadata_ht2)
+
+#fit M vals
+M.fit <- lmFit(M, design)
+#fit B vals
+B.fit <- lmFit(Beta, design)
+
+#fit contrasts
+
+M.fit2 <- eBayes(M.fit)
+
+#fit contrasts
+B.fit2 <- eBayes(B.fit)
+
+summary(decideTests(M.fit2))
+```
+
+```{r}
+## TWIST targeted DMP Finder: SPC2
+
+Mtt <- topTable(M.fit2, coef = 'SPC2', number = Inf, sort.by = 'none')
+
+Btt <- topTable(B.fit2, coef = 'SPC2', number = Inf, sort.by = 'none')
+
+save(Mtt, Btt, file = file.path(outdir, "Top_table_SPC2.rda"))
+```
+
+
+```{r}
+sessionInfo()
+```

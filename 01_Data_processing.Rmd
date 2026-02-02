@@ -135,11 +135,11 @@ pData(BS.obj) <- metadata
 keep = apply(getCoverage(BS.obj)!=0, 1, all)
 table(keep)
 
-#TOTAL=7936546...change these numbers accordingly
-#TRUE=7731583...change these numbers accordingly
+#TOTAL=7936546
+#TRUE=7731583
 
 BS.obj <- BS.obj[keep,] #remove marked CpG from the data set
-dim(BS.obj) #7731583....change this number accordingly
+dim(BS.obj) #7731583
 ```
 
 

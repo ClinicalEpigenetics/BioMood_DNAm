@@ -1,0 +1,345 @@
+---
+title: "BioMood - Sample QC"
+subtitle: "Grace Tavelli & Nikki Schultz"
+author: 
+  Telethon Kids Institute
+  University of Western Australia
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1.0 Setup
+
+## 1.1 Libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(minfi)
+library(annotatr)
+library(ggplot2)
+library(WGCNA)
+```
+
+
+## 1.2 Directories
+```{r}
+datadir <- '~/file_workspace/Collaborative\ Projects/HPC_CEPI/ANALYSIS/Biomood/Again_BioMood_DataProcessing_FullScript/'
+```
+
+## 1.3 Load Files
+```{r}
+# Load QC'd methylation data (BS.obj)
+load(file.path(datadir, "BS.obj.QC_QA.rda"))
+dim(BS.obj) # 52 samples, 7,719,881 CpGs
+
+# Load CaptureID to use for QC plots
+CaptureID <- read.csv(file.path(datadir, "Sample_Capture.csv"), stringsAsFactors = FALSE)
+
+```
+
+## 1.4 Upate metadata
+```{r}
+# Fix CaptureID sample IDs
+CaptureID$BioMood.ID <- sub(".*BioMood", "BioMood", CaptureID$sample_id)
+
+## Fix IDs for rpt strings
+CaptureID$BioMood.ID <- gsub("rpt", "", CaptureID$BioMood.ID)
+
+# Extract metadata dataframe from BS.obj
+metadata <- pData(BS.obj) %>% as.data.frame()
+
+# Sort CaptureID order to match with metadata
+matched <- match(metadata$BioMood.ID, CaptureID$BioMood.ID)
+
+# Join Capture pool to BS.obj
+metadata$capture_pool <- CaptureID$capture_pool[matched]
+
+pData(BS.obj) <- metadata
+
+## Capture pools as factor
+metadata$capture_pool <- as.factor(metadata$capture_pool)
+
+```
+
+# 2.0 Quality Control
+
+## 2.1 Figure 1A - Density Plot by Capture
+```{r}
+# Get raw methylation values
+raw_meth <- bsseq::getMeth(BS.obj, type = 'raw')
+
+# Define sample groups and enforce order from 1 to 7
+ordered_pools <- as.character(1:7)
+samp_groups <- factor(pData(BS.obj)$capture_pool, levels = ordered_pools)
+
+# Create custom color palette with pool 6 as pink
+custom_colors <- c("1" = "#E64B35",  # red
+                   "2" = "#4DBBD5",  # blue
+                   "3" = "#00A087",  # green
+                   "4" = "#3C5488",  # navy
+                   "5" = "#F39B7F",  # peach
+                   "6" = "#DC5A8C",  # pink
+                   "7" = "#8491B4")  # grey-blue
+palette <- custom_colors[levels(samp_groups)]
+
+
+par(mar = c(5, 4, 4, 10), xpd = TRUE)  # Extra space for legend
+densityPlot(dat = raw_meth,
+            sampGroups = samp_groups,
+            pal = palette,
+            legend = FALSE,           # Suppress automatic legend
+            frame.plot = FALSE,       # Suppress default border
+            xlim = c(-0.10, 1.1),
+            ylim = c(0, 9),
+            main = "Methylation Density by Capture",
+            xlab = "Methylation")
+box()  # Draw correctly aligned border
+legend("topright", inset = c(-0.2, 0), legend = levels(samp_groups),
+       title = "Capture Pool", col = palette, lty = 1, cex = 0.8)
+
+```
+
+## 2.2 PCA of CpG Islands
+
+### 2.2.1 Data setup
+```{r}
+# get CpG island annotations using annotatr
+cgislands = build_annotations(genome = 'hg19', annotations = c("hg19_cpg_islands", "hg19_cpg_shelves", "hg19_cpg_shores"))
+
+# convert chromosome format from Ensembl to UCSC
+seqlevels(cgislands) <- gsub("^chr", "", seqlevels(cgislands))
+
+# Subset BS.obj CpGs by cgislands
+bs.cgi <- subsetByOverlaps(BS.obj, cgislands)
+
+# Extract methylation ratios
+Beta_CpG_Islands <- bsseq::getMeth(bs.cgi, type = 'raw') %>%
+  as.matrix() %>%
+  round(2)
+colnames(Beta_CpG_Islands) <- metadata$BioMood.ID
+
+# Name rows by chromosome:position
+features_CpG_islands <- as.data.frame(bs.cgi@rowRanges)
+rownames(Beta_CpG_Islands) <- paste(features_CpG_islands$seqnames, features_CpG_islands$start, sep = ":")
+```
+
+```{r}
+# Perform PCA on CpGs within CpG Islands
+pca_CpG_Islands <- prcomp(t(Beta_CpG_Islands), center = TRUE, scale. = FALSE, retx = TRUE)
+cgisland_loadings <- pca_CpG_Islands$x %>% as.data.frame()
+rownames(cgisland_loadings) <- colnames(Beta_CpG_Islands)
+# Add PC1 and PC2 to metadata
+
+metadata_island_pcs <- metadata %>%
+  cbind(cgisland_loadings[,1:5])
+
+```
+
+### 2.2.2 Figure 1B - PCA Plot 
+```{r fig.height=6, fig.width=10}
+# PC1 v PC2 by Capture group
+ggplot(
+  metadata_island_pcs,
+  aes(x = PC1, y = PC2, color = capture_pool, shape = BioMood.group)
+) +
+  geom_point(alpha = 0.7, size = 3.5) +
+  geom_text(
+    aes(label = BioMood.ID),
+    size = 5,        # Larger than before
+    vjust = -0.5,
+    hjust = 0.5
+  ) +
+  scale_color_manual(values = palette, drop = FALSE) +
+  xlim(-200, 50) +
+  ylim(-150, 65) +
+  labs(
+    title = "PCA of CpG Islands",
+    x = "Principal Component 1",
+    y = "Principal Component 2",
+    color = "Capture",
+    shape = "BioMood Group"
+  ) +
+  theme_bw(base_size = 20) +
+  theme(
+    axis.text.x = element_text(size = 14, angle = 90, hjust = 1),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16),
+    plot.title = element_text(size = 20, face = "bold")
+  )
+```
+
+## 2.3 Remove poor quality samples
+```{r}
+# Define base IDs to remove
+ids_to_remove <- c("BioMood39", "BioMood50", "BioMood24", "BioMood35")
+
+# Create regex pattern to select IDs to remove
+pattern <- paste0("^(", paste(ids_to_remove, collapse = "|"), ")")
+
+# Find matching indices using grepl with anchored pattern
+id.mis <- which(sapply(metadata$BioMood.ID, function(x) grepl(pattern, x)))
+
+# Filter metadata and BSseq object
+metadata_filtered <- metadata[-id.mis, ]
+dim(metadata_filtered) # 48 samples
+BS.obj_filtered <- BS.obj[, -id.mis]
+dim(BS.obj_filtered) # 48 samples
+```
+
+# 3.0 Final dataset
+
+## 3.1 Beta and M objects
+```{r}
+# Create Beta matrix
+Beta_filtered <- bsseq::getMeth(BS.obj_filtered, type = "raw") %>%
+  as.matrix() %>%
+  round(2)  
+colnames(Beta_filtered) <- metadata_filtered$BioMood.ID
+
+# Create M matrix
+meth.cov_filtered   <- bsseq::getCoverage(BS.obj_filtered, type = "M")  # Methylated reads
+total.cov_filtered  <- bsseq::getCoverage(BS.obj_filtered)              # Total reads
+unmeth.cov_filtered <- total.cov_filtered - meth.cov_filtered           # Unmethylated reads
+
+# Calculate M-values (log2 ratio of methylated to unmethylated reads)
+
+M_filtered <- log2((meth.cov_filtered + 2) / (unmeth.cov_filtered + 2)) %>%
+  as.matrix() %>%
+  round(2)
+
+colnames(M_filtered) <- metadata_filtered$BioMood.ID
+
+
+# Rownames in chr:position format
+features_filtered <- as.data.frame(BS.obj_filtered@rowRanges)
+rownames(Beta_filtered) <- paste(features_filtered$seqnames, features_filtered$start, sep = ":")
+rownames(M_filtered)    <- paste(features_filtered$seqnames, features_filtered$start, sep = ":")
+```
+
+## 3.2 PCA 
+```{r}
+# Remove zero-variance CpGs
+row_variances <- apply(Beta_filtered, 1, var)
+Beta_nozero <- Beta_filtered[row_variances > 0, ]
+dim(Beta_nozero) # 7,589,804 CpGs remaining
+
+# remove the non-zero variance CpGs from M and bs object
+M_nozero <- M_filtered[rownames(M_filtered) %in% rownames(Beta_nozero),]
+dim(M_nozero)
+
+bsseq_coordinates <- paste0(seqnames(BS.obj_filtered), ":", start(BS.obj_filtered))
+cpgs_to_keep <- rownames(Beta_nozero)
+cpgs_to_keep_mask <- bsseq_coordinates %in% cpgs_to_keep
+BS.obj_nozero <- BS.obj_filtered[cpgs_to_keep_mask, ]
+dim(BS.obj_nozero)
+
+# Run PCA (samples as rows, CpGs as columns)
+pc <- prcomp(t(Beta_nozero), center = TRUE, scale. = FALSE)
+loadings <- pc$x %>% as.data.frame()
+
+# Add top 5 PCs to metadata
+metadata_pcs <- metadata_filtered %>%
+  as.data.frame() %>%
+  cbind(pc$x[, 1:5])
+
+```
+
+### 3.2.1 PCA Correlation Analysis
+
+```{r}
+#Matrix of covariates
+datTraits=data.frame(Diet = factor(metadata_pcs$BioMood.group),
+                    BMI =factor(metadata_pcs$BMIprepreg),
+                    Age = factor(metadata_pcs$Age))
+
+#Variables to specify
+nSamples = ncol(M_nozero)
+
+datTraits_numeric <- datTraits %>%
+  mutate(across(where(is.factor), ~ as.numeric(as.character(.))))
+
+#Spearman Correlation of the first 5 PC with the supplied covariates
+moduleTraitCor = cor(loadings[,c(1:5)], datTraits_numeric, use='complete.obs', method = "spearman")
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples)
+
+# Will display correlations and their p-values
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                   signif(moduleTraitPvalue, 1), ")", sep = "");
+                   dim(textMatrix) = dim(moduleTraitCor)
+
+dim(textMatrix) <- c(5, 3)
+
+```
+### 3.2.2 Results - Supplementary Figure 4
+```{r}
+labeledHeatmap(Matrix = t(moduleTraitCor),
+               xLabels = colnames(loadings)[1:5],
+               yLabels = names(datTraits_numeric),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(8),
+               textMatrix = t(textMatrix),
+               setStdMargins = FALSE,
+               cex.text = 0.6,
+               zlim = c(-1,1),
+               main = paste("PCA-trait relationships"))
+```
+
+
+# 4.0 Annotation
+```{r}
+annotations = build_annotations(genome = 'hg19', 
+                                annotations = c('hg19_basicgenes',
+                                                'hg19_genes_promoters',
+                                                'hg19_enhancers_fantom',
+                                                'hg19_cpgs',
+                                                'hg19_genes_intergenic'))
+
+# change the annotation object seqnames to ensembl format to match Beta data
+seqlevels(annotations) <- gsub("^chr", "", seqlevels(annotations))
+
+#convert result data frame to a GRanges object
+Beta_filtered.gr <- data.frame(strsplit2(rownames(Beta_filtered), ":"),
+                        Beta_filtered) %>% 
+                        dplyr::rename('chr' = 'X1') %>%
+                        dplyr::rename('start' = 'X2') %>%
+                        dplyr::mutate_at('start', as.numeric) %>%
+                        dplyr::mutate(end = start+1) %>%
+                        dplyr::relocate(end, .after = start) %>% GRanges()
+
+ 
+Beta_filtered_annotated <- annotate_regions(Beta_filtered,annotations) %>% as_tibble()
+
+Beta_filtered_annotated_df <- as.data.frame(Beta_filtered_annotated)
+
+annotation_map <- Beta_filtered_annotated_df%>%
+  group_by(seqnames, start, end) %>%
+  summarise(
+    # Option A: Paste annotations together into a single string
+    all_annotations = paste(annot.type, collapse = "; "),
+    annot_symbl = paste(annot.symbol, collapse = "; "),
+    .groups = 'drop' # Recommended to drop grouping at the end
+  )
+
+# add rownames in the format of chr:position
+rownames(annotation_map) <- paste0(annotation_map$seqnames, ":", annotation_map$start)
+
+#save(annotation_map, file = file.path(datadir, "BioMood_annotation_map.Rdata"))
+load(file.path(datadir, "BioMood_annotation_map"))
+```
+
+# 5.0 Save 
+```{r}
+save(BS.obj_nozero, metadata_pcs, Beta_nozero, M_nozero, file = file.path(datadir, "Final_QC_dataset.rda"))
+```
+

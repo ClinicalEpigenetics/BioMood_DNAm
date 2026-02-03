@@ -1,0 +1,918 @@
+---
+title: "BioMood - Mediterranean Diet Adherence EWAS"
+subtitle: "Grace Tavelli & Nikki Schultz"
+author: 
+  Telethon Kids Institute
+  University of Western Australia
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1.0 Setup
+
+## 1.1 Libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(minfi)
+library(annotatr)
+library(ggplot2)
+library(limma)
+library(rGREAT)
+library(ggmanh)
+library(ggpubr)
+library(DMRcate)
+library(edgeR)
+library(enrichR)
+library(GEOquery)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(Gviz)
+library(rtracklayer)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
+```
+
+
+## 1.2 Directories
+```{r}
+datadir <- '~/file_workspace/Collaborative\ Projects/HPC_CEPI/ANALYSIS/Biomood/Again_BioMood_DataProcessing_FullScript/'
+```
+
+## 1.3 Load Files
+```{r}
+# Load QC'd methylation data (BS.obj) from script "02.Sample_QC.Rmd"
+load(file.path(datadir, "Final_QC_dataset.rda"))
+dim(Beta_nozero) # 48 samples, 7,589,804 CpGs
+
+# Load annotation reference map
+load(file.path(datadir, "BioMood_annotation_map.RData"))
+
+## subset annotation map for zero variance CpGs (as used in Beta and M)
+nozero_cpgs <- rownames(Beta_nozero)
+annotation_map_nozero <- annotation_map[nozero_cpgs,]
+```
+
+# 2.0 Hypothesis Testing
+
+## 2.1 HMDA vs LMDA EWAS
+```{r}
+# EWAS design - BioMood.group (HMDA = 1, LMDA = 2) + PCs 1 - 4
+design <- model.matrix(
+  ~ as.factor(BioMood.group) + PC1 + PC2 + PC3 + PC4,
+  data = metadata_pcs
+)
+
+# Fit model to M-values
+M.fit <- limma::lmFit(M_nozero, design)
+
+# Fit model to Beta-values
+B.fit <- limma::lmFit(Beta_nozero, design)
+
+# Apply empirical Bayes moderation
+M.fit2 <- limma::eBayes(M.fit)
+B.fit2 <- limma::eBayes(B.fit)
+
+# Summarize hypothesis testing results
+
+summary(limma::decideTests(M.fit2))
+```
+
+```{r}
+# Top Tables
+
+## M values
+Mtt <- limma::topTable(M.fit2, coef = "as.factor(BioMood.group)1", number = Inf, sort.by = "none")
+
+# Beta values 
+Btt <- limma::topTable(B.fit2,coef = "as.factor(BioMood.group)1", number = Inf, sort.by = "none")
+
+# Format for annotation
+Mtt_formatted <- Mtt %>%
+  mutate(chr = sub(":.*", "", row.names(Mtt)),
+         CpG_location = sub(".*:", "", row.names(Mtt)),
+         EffectSize = round(Btt$logFC, 3),
+         P.Value = P.Value,
+         is.sig = Mtt$P.Value <= 1e-5) %>%
+  arrange(P.Value) %>%
+  dplyr::select(chr, CpG_location, EffectSize, P.Value, is.sig)
+
+```
+
+### 2.1.1 Results - Table 2
+```{r}
+Table_two <- Mtt_formatted %>%
+    mutate(chr = paste0("chr", Mtt_formatted$chr),
+         start = as.numeric(CpG_location),
+         end = start + 1) %>%
+  head(n = 10) 
+
+Table_two_gr <- Table_two %>% GRanges()
+
+
+# Nearest Gene Annotations
+## Annotate nearest TSS using rGREAT
+
+job <- submitGreatJob(Table_two_gr, species = "hg19")
+
+# Get the distance to the nearest TSS
+
+table_two_associations <- getRegionGeneAssociations(job)
+
+table_two_assoc_df <- as.data.frame(table_two_associations)
+
+gene_table <- table_two_assoc_df %>%
+    unnest(cols = c(annotated_genes, dist_to_TSS)) %>%
+  mutate(Nearest_gene = paste0(annotated_genes, " (", dist_to_TSS, ")")) %>%
+  group_by(seqnames, start) %>%
+  summarise(
+    across(everything(), ~ paste(unique(.), collapse = ", ")),
+    .groups = "drop"
+  ) %>%
+  dplyr::select(start, Nearest_gene)
+
+# Final format
+Table_two_final <- Table_two %>%
+  left_join(gene_table, by = "start") %>%
+  dplyr::select(chr, CpG_location, EffectSize, P.Value, Nearest_gene)
+```
+
+### 2.1.2 Results - Supplementary Table 2A
+```{r}
+# format data 
+Mtt_formatted_sig <- Mtt_formatted %>%
+  mutate(chr = paste0("chr", Mtt_formatted$chr),
+         start = as.numeric(CpG_location),
+         end = start + 1) %>%
+  filter(is.sig == TRUE)
+
+# make GRanges object
+Mtt_sig_gr <- Mtt_formatted_sig %>% GRanges()
+
+# Annotate nearest TSS using rGREAT
+Mtt_sig_job <- submitGreatJob(Mtt_sig_gr, species = "hg19")
+
+# Get the distance to the nearest TSS
+Mtt_sig_associations <- getRegionGeneAssociations(Mtt_sig_job)
+
+Mtt_sig_assoc_df <- as.data.frame(Mtt_sig_associations)
+
+# select the closest gene
+Mtt_sig_tss_df <- Mtt_sig_assoc_df %>%
+    unnest(cols = c(annotated_genes, dist_to_TSS)) %>%
+    mutate(abs_dist = abs(dist_to_TSS)) %>%
+   group_by(seqnames, start, end) %>%
+    slice_min(abs_dist, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# final format
+Supp_table_2A <- Mtt_formatted_sig %>%
+  left_join(Mtt_sig_tss_df, by = c("chr" = "seqnames", "start", "end"))  %>%
+  mutate(Nearest_gene = paste0(annotated_genes, " (", dist_to_TSS, ")")) %>%
+  dplyr::select(chr, CpG_location, EffectSize, P.Value, Nearest_gene) 
+
+```
+
+### 2.1.3 Results - Figure 2A
+```{r}
+# Manhattan Plot
+
+## Create data frame for plotting
+mhp_data <- data.frame(
+  chromosome = Mtt_formatted$chr,
+  position   = as.numeric(Mtt_formatted$CpG_location),
+  P.value    = Mtt_formatted$P.Value
+)
+
+## chromosome factor order
+mhp_data$chromosome <- factor(mhp_data$chromosome, levels = c(as.character(1:22), "X"))
+
+## colour scheme
+mhp_data$color <- ifelse(as.numeric(mhp_data$chromosome) %% 2 == 0, "Even", "Odd")
+mhp_data$color[mhp_data$P.value < 1e-5] <- "Significant"
+
+highlight_colormap <- c(
+  "Odd"         = "#6caeff", 
+  "Even"        = "#2b5d9b", 
+  "Significant" = "#FF8C00"
+)
+
+## plot
+manhattan_plot(
+  x           = mhp_data,
+  pval.colname = "P.value",
+  chr.colname  = "chromosome",
+  pos.colname  = "position",
+  y.label      = "-log10(P value)",
+  highlight.colname = "color", highlight.col = highlight_colormap, color.by.highlight = TRUE
+) +
+  theme(
+    plot.title       = element_text(size = 22, face = "bold"),
+    axis.title.x     = element_text(size = 14),
+    axis.title.y     = element_text(size = 14),
+    axis.text.x      = element_text(size = 10),
+    axis.text.y      = element_text(size = 10)
+  ) 
+
+```
+
+### 2.1.4 Results - Figure 2D
+```{r}
+# Boxplots of methylation by CpG
+
+## Set up data
+features.of.interest = rownames(Mtt_formatted)[1:10] #  list of top features
+
+## select Betas
+MDA_dmps_Beta <- Beta_nozero[features.of.interest,] %>%
+  t() 
+
+## add BioMood groups
+MDA_Beta_with_meta <- MDA_dmps_Beta %>%
+  cbind(metadata_pcs$BioMood.group) %>%
+  as.data.frame()
+colnames(MDA_Beta_with_meta)[11] <- "BioMood.group"
+  MDA_Beta_with_meta$BioMood.group = ifelse(MDA_Beta_with_meta$BioMood.group == 0, "Low", "High")
+  
+## convert to long format for plotting
+MDA_Beta_long <- MDA_Beta_with_meta %>%
+  pivot_longer(
+    cols = "18:10453700":"1:201749312",
+    names_to = "CpG_Site",
+    values_to = "Beta"
+  ) 
+
+### Boxplot 1 - APCDD1
+APCDD_data <- MDA_Beta_long %>%
+  filter(CpG_Site == "11:129488337")
+
+
+ggdotplot(APCDD_data, x = 'BioMood.group', y = "Beta", add = 'boxplot', color = 'BioMood.group', fill = 'BioMood.group', 
+                                               palette = c("#f4a582", "#92c5de")) +  
+  ylim(0,1) +
+               labs(title = "APCDD1", y = "% Methylation") +
+                 theme(plot.title = element_text(size = 14, hjust = 0.5, face = "bold"),
+                       axis.title = element_text(size=14),
+         axis.text = element_text(size = 10)) +
+            stat_compare_means(method = "wilcox.test", label = "p.format", label.x = 1.5)
+
+### Boxplot 2 - COL18A1
+COL18_data <-  MDA_Beta_long %>%
+  filter(CpG_Site == "21:46924305")
+
+ggdotplot(COL18_data, x = 'BioMood.group', y = "Beta", add = 'boxplot', color = 'BioMood.group', fill = 'BioMood.group', 
+                                               palette = c("#f4a582", "#92c5de")) +  
+  ylim(0,1) +
+               labs(title = "COL81A1", y = "% Methylation") +
+                 theme(plot.title = element_text(size = 14, hjust = 0.5, face = "bold"),
+                       axis.title = element_text(size=14),
+         axis.text = element_text(size = 10)) +
+            stat_compare_means(method = "wilcox.test", label = "p.format",label.x = 1.5)
+
+### Boxplot 3 - RNF223
+RNF_data <-  MDA_Beta_long %>%
+  filter(CpG_Site == "1:1011561")
+
+ggdotplot(RNF_data, x = 'BioMood.group', y = "Beta", add = 'boxplot', color = 'BioMood.group', fill = 'BioMood.group', 
+                                               palette = c("#f4a582", "#92c5de")) +  
+  ylim(0,1) +
+               labs(title = "RNF223", y = "% Methylation") +
+                 theme(plot.title = element_text(size = 14, hjust = 0.5, face = "bold"),
+                       axis.title = element_text(size=14),
+         axis.text = element_text(size = 10)) +
+            stat_compare_means(method = "wilcox.test", label = "p.format", label.x = 1.5)
+```
+
+## 2.2 DMR Testing
+```{r}
+# DMR Testing using DMRcate
+
+## set up design using edgeR 
+design_dmr <- modelMatrixMeth(design)
+colnames(design_dmr)[1:48] <- colnames(M_nozero)
+
+## construct DMRcate object
+dmr_seqannot <- sequencing.annotate(BS.obj_nozero, design_dmr, coef=50, fdr = 0.05)
+
+## find DMRs
+dmrcoutput <- dmrcate(dmr_seqannot,lambda=1000, C=2, min.cpgs = 4, pcutoff = 0.05)
+
+## convert to data frame 
+dmr_results <- extractRanges(dmrcoutput, genome = 'hg19') 
+
+dmr_results_df <- dmr_results %>%
+    as.data.frame %>% 
+    mutate(betaAfc = abs(meandiff)) 
+
+## print to screen
+dmr_results_df
+```
+```{r}
+# Annotate DMRs using annotation map
+annotation_map_gr <- annotation_map %>% GRanges()
+
+dmr_results_gr <- with(dmr_results_df, GRanges(
+  seqnames = seqnames,
+  ranges = IRanges(start = start, end = end),
+  DMR_ID = 1:nrow(dmr_results_df) 
+))
+
+dmr_results_overlaps <- findOverlaps(dmrs_results_gr, annotation_map_gr)
+
+overlaps_df <- data.frame(
+  DMR_ID = dmr_results_gr$DMR_ID[queryHits(dmr_results_overlaps)],
+  Gene_Name = annotation_map_gr$annot_symbl[subjectHits(dmr_results_overlaps)]
+)
+
+overlaps_df <- distinct(overlaps_df)
+
+aggregated_genes_unnested <- overlaps_df %>%
+    separate_rows(Gene_Name, sep = "; ") %>%
+    mutate(Gene_Name = trimws(Gene_Name)) %>%
+    mutate(
+    Gene_Name = if_else(
+      tolower(Gene_Name) %in% c("na", "", " "), 
+      NA_character_,
+      Gene_Name
+    )
+  ) %>%
+    group_by(DMR_ID) %>%
+  summarise(
+    Overlapping_Genes = {
+      non_na_names <- na.omit(Gene_Name)
+      paste(unique(non_na_names), collapse = "; ")
+    },
+    .groups = 'drop' 
+  )
+
+dmr_results_df$DMR_ID <- 1:nrow(dmr_results_df)
+
+dmr_results_annotated <- dmr_results_df %>%
+  left_join(aggregated_genes_unnested, by = "DMR_ID") %>%
+  dplyr::select(-c(DMR_ID, overlapping.genes))
+```
+
+
+### 2.2.1 Results - Supplementary Table 2B
+```{r}
+# select DMRs with absolute maximum diff > 1
+top_dmr_results <- dmr_results_df %>%
+   mutate(seqnames = paste0("chr", dmr_results_df$seqnames)) %>%
+   filter(abs(maxdiff) > 1)
+
+# convert to GRanges object
+top_dmr_results_gr <- top_dmr_results %>% GRanges()
+
+# annotate nearest TSS using rGREAT
+top_dmr_results_job <- submitGreatJob(top_dmr_results_gr, species = "hg19")
+
+# get the distance to the nearest TSS
+
+top_dmr_results_associations <- getRegionGeneAssociations(top_dmr_results_job)
+
+top_dmr_results_assoc_df <- as.data.frame(top_dmr_results_associations)
+
+# select the nearest TSS for each DMR
+top_dmr_tss_df <- top_dmr_results_assoc_df %>%
+  unnest(cols = c(annotated_genes, dist_to_TSS)) %>%
+  mutate(abs_dist = abs(dist_to_TSS)) %>%
+    group_by(seqnames, start, end) %>%
+    slice_min(abs_dist, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+top_dmr_results_annot <- top_dmr_results %>%
+  left_join(top_dmr_tss_df, by = c("seqnames", "start", "end"))
+
+# format for paper
+Supp_table_2B <- top_dmr_results_annot %>%
+  mutate(region = paste0(start, " - ", end),
+         Gene = paste0(annotated_genes, " (", dist_to_TSS, ")")) %>%
+  dplyr::select(seqnames, region, width.x, no.cpgs, min_smoothed_fdr, maxdiff, meandiff, Gene)
+colnames(Supp_table_2B) <- c("Chr", "Genomic_Region", "DMR_Width", "No_CpGs", "FDR", "Max_logFC", "Mean_logFC", "Nearest_gene")
+```
+
+### 2.2.2 Results - Figure 2B
+```{r}
+# Volcano plot of DMR results 
+
+
+## colour scheme
+fun_color_range <- colorRampPalette(c('#ca0020', '#f4a582','#f7f7f7',	'#92c5de', '#0571b0'))
+my_colors <- fun_color_range(5)  
+
+# fix one of the DMRs to print better
+MDA_dmrs_annotated <- MDA_dmrs_annotated %>%
+  mutate(Overlapping_Genes = gsub("TMEM151B; SPATS1; TCTE1", "TCTE1", MDA_dmrs_annotated$Overlapping_Genes))
+
+## change width to log width for more spread along y axis
+dmr_results_annotated$log_width <- log(dmr_results_annotated$width)  
+
+# volcano plot
+ggscatter(dmr_results_annotated, x = "maxdiff", y = "log_width", 
+   color = "maxdiff", size = 3,
+   label = "Overlapping_Genes", 
+   label.select = list(criteria = "dmr_results_annotated$maxdiff > 2.4 | dmr_results_annotated$maxdiff < -2.4"),
+       repel = TRUE,
+   font.label = c(8, "plain", "black"),
+   xlab = 'Methylation Difference (logFC)',
+   ylab = 'Log(n) region size (bp)',
+    ggtheme = theme_bw(base_rect_size = 2, base_size = 20)) +
+   labs(color = "DMR Max \nDifference")+
+   theme(axis.title = element_text(size=14),
+         axis.text = element_text(size = 10),
+         legend.title = element_text(size = 14),
+         legend.text = element_text(size = 10)) +
+  scale_colour_gradientn(colors = my_colors) 
+```
+
+### 2.2.3 Results - Figure 2C
+```{r}
+# GSEA using enrichR
+
+## set up enrichR connection
+# connecting to enrichR and setting up
+websiteLive <- getOption("enrichR.live")
+
+if (websiteLive) {
+    listEnrichrSites()
+    setEnrichrSite("Enrichr") # Human genes
+}
+
+if (websiteLive) {
+    dbs <- listEnrichrDbs()
+    head(dbs)
+}
+
+# select KEGG database
+kegg_db <- "KEGG_2021_Human"
+
+# list of top genes (absolute maximum difference > 1)
+top_max_gene_list <- dmr_results_annot_top %>%
+    separate_longer_delim(Overlapping_Genes, delim = "; ") %>% 
+    pull(Overlapping_Genes) %>%
+    unique() %>%
+  na.omit()
+
+## remove the empty strings
+top_max_gene_list <- top_max_gene_list[top_max_gene_list != "" & !is.na(top_max_gene_list)]
+
+# list of background genes
+
+background_gene_list <- annotation_map_nozero %>%
+    separate_longer_delim(annot_symbl, delim = "; ") %>% 
+    pull(annot_symbl) %>%
+    unique() %>%
+  na.omit()
+
+# remove the weird empty strings
+background_gene_list <- background_gene_list[background_gene_list != "" & !is.na(background_gene_list)]
+
+# run enrichr
+enriched_kegg <- enrichr(top_max_gene_list, kegg_db, background = background_gene_list)
+
+# plot
+plotEnrich(enriched_kegg[["KEGG_2021_Human"]], showTerms = 20, numChar = 40, 
+           y = "Count", orderBy = "P.value", title = "")
+```
+
+# 3.0 Replication Analysis
+
+## 3.1 PREDIMED Comparative Analysis
+```{r}
+# load Arpon et al. methylation data from GEO
+
+gset <- getGEO("GSE107205", GSEMatrix =TRUE, getGPL=FALSE)
+if (length(gset) > 1) idx <- grep("GPL13534", attr(gset, "names")) else idx <- 1
+gset <- gset[[idx]]
+
+# extract Betas
+Beta_arpon <- gset@assayData$exprs
+
+metadata_arpon <- gset@phenoData@data
+metadata_arpon_sub <- metadata_arpon %>%
+  dplyr::select(geo_accession, characteristics_ch1, characteristics_ch1.1) %>%
+  mutate(Sex = ifelse(characteristics_ch1 =="Sex: Female", "Female", "Male"),
+         Diet.group = ifelse(characteristics_ch1.1 == "diet: Low-fat diet", "Low_fat", "MedDiet"))
+
+```
+
+```{r}
+# subset our DMR analysis results for top hits (max logFC > 1)
+MDA_dmrs_top <- dmr_results_annotated %>%
+  filter(abs(maxdiff) >= 1)
+
+# get annotation information for CpGs within 69 DMRs
+MDA_dmrs_top_gr <- GRanges(MDA_dmrs_top)
+MDA_dmr_top_cpgs <- subsetByOverlaps(annotation_map_gr, MDA_dmrs_top_gr)
+MDA_dmr_top_cpgs <- as.data.frame(MDA_dmr_top_cpgs)
+MDA_dmr_top_cpgs$CpG <- paste0(MDA_dmr_top_cpgs$seqnames, ":", MDA_dmr_top_cpgs$start)
+
+# get Illumina 450k annotation 
+ann450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+ann450k_df <- as.data.frame(ann450k)
+
+ann450k_map <- ann450k_df %>%
+  dplyr::select(chr, pos, Name, UCSC_RefGene_Name) %>%
+  mutate(CpG = paste0(gsub("chr", "", ann450k_df$chr), ":", ann450k_df$pos))
+
+# find overlapping CpGs between Arpon dataset and ours
+cpgs_interest <- MDA_dmr_top_cpgs$CpG
+arpon_cpgs_interest <- ann450k_map[ann450k_map$CpG %in% cpgs_interest,]
+
+# subset Beta and M matrices for overlapping CpGs
+Beta_arpon_overlap <- Beta_arpon[arpon_cpgs_interest$Name,]
+
+M_arpon_overlap <- log2(Beta_arpon_overlap / (1 - Beta_arpon_overlap)) %>%
+  as.matrix() %>%
+  round(2)
+
+# run PCA for use with model
+
+arpon_pc <- prcomp(t(Beta_arpon), center = TRUE, scale. = FALSE)
+arpon_loadings = arpon_pc$x
+
+metadata_arpon_sub <- metadata_arpon_sub %>%
+  cbind(arpon_loadings[,1:5])
+```
+
+```{r}
+# Comparative logistic regression
+arpon_design_pc <- model.matrix(
+  ~ as.factor(Diet.group) + PC1 + PC2 + PC3 + PC4,
+  data = metadata_arpon_sub)
+
+# Fit model to M-values
+M.fit_arpon_pc <- limma::lmFit(M_arpon_overlap, arpon_design_pc)
+
+# Fit model to Beta-values
+B.fit_arpon_pc <- limma::lmFit(Beta_arpon_overlap, arpon_design_pc)
+
+
+M.fit2_arpon_pc <- limma::eBayes(M.fit_arpon_pc)
+B.fit2_arpon_pc <- limma::eBayes(B.fit_arpon_pc)
+
+# M value top table
+Mtt_arpon_pc <- limma::topTable(
+  M.fit2_arpon_pc,
+  coef = "as.factor(Diet.group)MedDiet",  
+  number = Inf,                        
+  sort.by = "none"
+)
+
+# Beta values top table
+Btt_arpon_pc <- limma::topTable(
+  B.fit2_arpon_pc,
+  coef = "as.factor(Diet.group)MedDiet",
+  number = Inf,
+  sort.by = "none"
+)
+
+# annotate results
+ProbeIDs <- arpon_cpgs_interest$Name
+
+annotated_arpon_pc <- GRanges(as.character(ann450k_map[ProbeIDs,]$chr), IRanges(ann450k_map[ProbeIDs,]$pos, 
+                ann450k_map[ProbeIDs,]$pos), 
+                stat = Mtt_arpon_pc$t, 
+                diff = Btt_arpon_pc$logFC, 
+                ind.fdr = Mtt_arpon_pc$adj.P.Val, 
+                rawpval = Mtt_arpon_pc$P.Value, 
+                is.sig = Mtt_arpon_pc$P.Value < 1e-5, 
+                ProbeID=rownames(Mtt_arpon_pc),
+                Gene=ann450k_map[ProbeIDs,]$UCSC_RefGene_Name)
+names(annotated_arpon_pc)=rownames(Mtt_arpon_pc)
+annotated_arpon_pc <- sort(annotated_arpon_pc)
+
+#convert ewas statistics to S4 class, for use with DMRcate
+ewas_arpon_pc <- new("CpGannotated", ranges = annotated_arpon_pc)
+
+```
+
+### 3.1.1 Results - DMR Analysis
+
+Used in Table 3.
+
+```{r}
+# DMR analysis
+dmrcoutput_arpon_pc         <- dmrcate(ewas_arpon_pc,lambda=1000, C=2, min.cpgs = 4, pcutoff = 0.05)
+
+#convert to data frame and filter 
+dmrs_arpon_pc <- extractRanges(dmrcoutput_arpon_pc) 
+
+dmrs.df_arpon_pc <- dmrs_arpon_pc %>%
+    as.data.frame %>% 
+    mutate(betaAfc = abs(meandiff)) 
+
+#Print to screen
+dmrs.df_arpon_pc
+```
+
+### 3.1.2 Results - Figure 3
+
+#### 3.1.2.1 COL18A1
+```{r}
+# COL18A1 DMR plot
+
+## set up data
+
+### location
+gen = "hg19"
+COL_chr = 21
+COL_start = 46825080
+COL_end = 46933634
+
+### extract CpGs within COL18A1 genomic region
+COL_dmr1_Betas <- as.data.frame(Beta_nozero) %>%
+  rownames_to_column("location") %>%
+  separate(location, into = c("chr", "pos"), sep = ":", remove = FALSE) %>%
+  mutate(pos = as.numeric(pos)) %>%
+    filter(chr == "21", pos >= COL_start, pos <= COL_end)
+
+#### prepare the group data for joining with COL18A1 CpGs
+Biomood_group <- metadata_pcs %>% dplyr::select(BioMood.ID, BioMood.group)
+Biomood_group$BioMood.group <- ifelse(Biomood_group$BioMood.group == 0, "Low", "High")
+
+Biomood_group$BioMood.group <- factor(Biomood_group$BioMood.group, levels = c("Low", "High"))
+
+#### join group information with Betas
+COL_df <- COL_dmr1_Betas %>% dplyr::select(,-c(1:3)) %>%
+  t() %>% as.data.frame() %>%
+  rownames_to_column("BioMood.ID") %>%
+  left_join(Biomood_group, by = "BioMood.ID") 
+colnames(COL_df)[2:2935] <- COL_dmr1_Betas$pos
+
+
+#### convert to long format
+COL_df_long <- COL_df %>%
+  pivot_longer(cols = 2:2935,
+    names_to = "CpG_Site",
+    values_to = "Beta")
+
+#### calculate mean Betas per group per CpG
+COL_summary <- COL_df_long %>%
+  group_by(CpG_Site, BioMood.group) %>%
+  summarise(mean_beta = mean(Beta, na.rm = TRUE))
+colnames(COL_summary)[1] <- "pos"
+
+COL_plot_data_wide <- COL_summary %>%
+  ungroup() %>% 
+  dplyr::select(pos, BioMood.group, mean_beta) %>%
+  pivot_wider(
+    names_from = BioMood.group, 
+    values_from = mean_beta
+  ) %>%
+  arrange(pos)
+
+#### extract COL18A1 DMRs
+COL_dmrs <- dmr_results_annotated %>%
+  filter(seqnames == 21 & start >= COL_start & end <= COL_end)
+features <- ifelse(COL_dmrs$maxdiff > 0, "Hyper", "Hypo")
+
+## set up Gviz tracks 
+
+### load CpG island data from UCSC
+#### get UCSC table manually
+session <- browserSession()
+genome(session) <- "hg19"
+
+COL_query <- ucscTableQuery(session, 
+                        table = "cpgIslandExt", 
+                        range = GRanges("chr21", IRanges(COL_start, COL_end)))
+
+COL_table_data <- getTable(COL_query)
+
+COL_cpgIslands <- AnnotationTrack(start = COL_table_data$chromStart, 
+                               end = COL_table_data$chromEnd, 
+                               chromosome = "chr21", 
+                               genome = "hg19",
+                               name = "CpG Islands", 
+                               fill = "#006400",
+                               id = COL_table_data$name,
+                               shape = "box",
+                              stacking = "squish")
+
+### genome axis track
+COL_gtrack <- GenomeAxisTrack()
+COL_itrack <- IdeogramTrack(genome = gen, chromosome = COL_chr)
+
+### refseq gene track
+
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+
+COL_refGenes <- GeneRegionTrack(txdb, 
+                            chromosome = "chr21", 
+                            start = COL_start, 
+                            end = COL_end,
+                            name = "UCSC Genes",
+                            fill = "#8282d2",
+                            transcriptAnnotation = "symbol", 
+                            showId = TRUE)
+
+COL_symbols <- unlist(mapIds(org.Hs.eg.db, 
+                         keys = gene(COL_refGenes), 
+                         column = "SYMBOL", 
+                         keytype = "ENTREZID"))
+symbol(COL_refGenes) <- COL_symbols[gene(COL_refGenes)]
+
+### methylation dmr track
+COL_methTrack <- DataTrack(data = t(COL_plot_data_wide[, c("Low", "High")]), 
+                       start = COL_plot_data_wide$pos,
+                       end = COL_plot_data_wide$pos, 
+                       chromosome = "chr21", 
+                       genome = "hg19",
+                       name = "Methylation",
+                       type = c("a", "p"),
+                       groups = c("Low", "High"),
+                       col = c("High" = "#9a52a3", "Low" = "#e66101"))
+
+### DMR results track
+
+COL_dmrTrack <- AnnotationTrack(
+  start = COL_dmrs$start,
+  end = COL_dmrs$end,
+  chromosome = "chr21",
+  feature = features, # Map the hyper/hypo status here
+  name = "DMR Status",
+  stacking = "squish",
+  col = "transparent",
+  # Define colors for those features
+  Hyper = "#B2182B",
+  Hypo = "#2166AC"
+)
+
+### Arpon significant CpG track
+COL_arpon_pos <- 46858801 
+
+COL_arponTrack <- AnnotationTrack(
+  start = COL_arpon_pos,
+  end = COL_arpon_pos,
+  chromosome = "chr21",
+  id = "Arpon",              # This is the label that will show up
+  name = "Arpon CpG",
+  stacking = "squish",
+  # Aesthetics for a single point
+  shape = "arrow",             # Or "arrow"
+  fill = "#d7191c",             # Make it a bright color to stand out
+  col = "transparent",             # Border color
+ 
+  
+)
+
+### fix the display
+displayPars(COL_arponTrack) <- list(size=3)
+displayPars(COL_dmrTrack) <- list(size=3)
+displayPars(COL_cpgIslands) <- list(size=3)
+
+plotTracks(list(COL_itrack, COL_gtrack, COL_cpgIslands, COL_refGenes, COL_methTrack, COL_dmrTrack, COL_arponTrack), showTitle = TRUE)
+```
+
+#### 3.1.2.2 PPARGC1B
+```{r}
+# location details
+PPAR_start <- 149107990  # extended slightly from NCBI margins
+PPAR_end <- 149234585
+
+# pull out all the CpGs for PPARGC1B
+PPAR_dmr_Betas <- as.data.frame(Beta_nozero) %>%
+  rownames_to_column("location") %>%
+  separate(location, into = c("chr", "pos"), sep = ":", remove = FALSE) %>%
+    mutate(pos = as.numeric(pos)) %>%
+    filter(chr == "5", pos >= PPAR_start, pos <= PPAR_end)
+
+PPAR_df <- PPAR_dmr_Betas %>% dplyr::select(,-c(1:3)) %>%
+  t() %>% as.data.frame() %>%
+  rownames_to_column("BioMood.ID") %>%
+  left_join(Biomood_group, by = "BioMood.ID") 
+colnames(PPAR_df)[2:642] <- PPAR_dmr_Betas$pos
+
+
+# convert to long format
+PPAR_df_long <- PPAR_df %>%
+  pivot_longer(cols = 2:642,
+    names_to = "CpG_Site",
+    values_to = "Beta")
+
+# mean methylation data per group
+PPAR_summary <- PPAR_df_long %>%
+  group_by(CpG_Site, BioMood.group) %>%
+  summarise(mean_beta = mean(Beta, na.rm = TRUE))
+colnames(PPAR_summary)[1] <- "pos"
+
+# convert to wide format for plotting
+PPAR_plot_data_wide <- PPAR_summary %>%
+  ungroup() %>% 
+  dplyr::select(pos, BioMood.group, mean_beta) %>%
+  pivot_wider(
+    names_from = BioMood.group, 
+    values_from = mean_beta
+  ) %>%
+  arrange(pos)
+
+# DMR data 
+PPAR_dmrs <- dmr_results_annotated %>%
+  filter(seqnames == 5 & start >= PPAR_start & end <= PPAR_end)
+PPAR_features <- ifelse(PPAR_dmrs$maxdiff > 0, "Hyper", "Hypo")
+
+```
+
+```{r}
+# set up the Gviz tracks
+
+PPAR_chr = "chr5"
+
+# CpG Island track data
+PPAR_query <- ucscTableQuery(session, 
+                        table = "cpgIslandExt", 
+                        range = GRanges("chr5", IRanges(PPAR_start, PPAR_end)))
+
+PPAR_table_data <- getTable(PPAR_query)
+
+PPAR_cpgIslands <- AnnotationTrack(start = PPAR_table_data$chromStart, 
+                               end = PPAR_table_data$chromEnd, 
+                               chromosome = PPAR_chr, 
+                               genome = "hg19",
+                               name = "CpG Islands", 
+                               fill = "#006400",
+                               id = PPAR_table_data$name,
+                               shape = "box",
+                              stacking = "squish")
+
+# genome axis track
+PPAR_gtrack <- GenomeAxisTrack()
+PPAR_itrack <- IdeogramTrack(genome = gen, chromosome = PPAR_chr)
+
+# RefSeq gene track
+PPAR_refGenes <- GeneRegionTrack(txdb, 
+                            chromosome = PPAR_chr, 
+                            start = PPAR_start, 
+                            end = PPAR_end,
+                            name = "UCSC Genes",
+                            fill = "#8282d2",
+                            transcriptAnnotation = "symbol", 
+                            showId = TRUE)
+
+PPAR_symbols <- unlist(mapIds(org.Hs.eg.db, 
+                         keys = gene(PPAR_refGenes), 
+                         column = "SYMBOL", 
+                         keytype = "ENTREZID"))
+symbol(PPAR_refGenes) <- PPAR_symbols[gene(PPAR_refGenes)]
+
+# methylation data track
+PPAR_methTrack <- DataTrack(data = t(PPAR_plot_data_wide[, c("High", "Low")]), 
+                       start = PPAR_plot_data_wide$pos,
+                       end = PPAR_plot_data_wide$pos, 
+                       chromosome = PPAR_chr, 
+                       genome = "hg19",
+                       name = "Methylation",
+                       type = c("a", "p"), # 'a' for lines, 'p' for points
+                       groups = c("High", "Low"),
+                       col = c("High" = "#9a52a3", "Low" = "#e66101"))
+
+
+# DMR track
+PPAR_dmrTrack <- AnnotationTrack(
+  start = PPAR_dmrs$start,
+  end = PPAR_dmrs$end,
+  chromosome = PPAR_chr,
+  feature = PPAR_features, # Map the hyper/hypo status here
+  name = "DMR Status",
+  stacking = "squish",
+  col = "transparent",
+  
+  # Define colors for those features
+ Hyper = "#B2182B",
+  Hypo = "#2166AC"
+)
+
+# Arpon significant CpG track
+PPAR_arpon_pos <- 149111017 
+
+PPAR_arponTrack <- AnnotationTrack(
+  start = PPAR_arpon_pos,
+  end = PPAR_arpon_pos,
+  chromosome = "chr5",
+  id = "Arpon",              # This is the label that will show up
+  name = "Arpon CpG",
+  stacking = "squish",
+  # Aesthetics for a single point
+  shape = "arrow",             # Or "arrow"
+  fill = "#2c7bb6",             # Make it a bright color to stand out
+  col = "transparent"             # Border color
+)
+
+# formatting for visibility
+displayPars(PPAR_arponTrack) <- list(size=4)
+displayPars(PPAR_dmrTrack) <- list(size=3)
+displayPars(PPAR_cpgIslands) <- list(size=3)
+
+plotTracks(list(PPAR_itrack, PPAR_gtrack, PPAR_cpgIslands, PPAR_refGenes, PPAR_methTrack, PPAR_dmrTrack, PPAR_arponTrack))
+```
+
+
+

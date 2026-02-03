@@ -1,0 +1,498 @@
+---
+title: "BioMood - Metabolite EWAS"
+subtitle: "Grace Tavelli & Nikki Schultz"
+author: 
+  Telethon Kids Institute
+  University of Western Australia
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1.0 Setup
+
+## 1.1 Libraries
+```{r}
+library(tidyverse)
+library(limma)
+library(DMRcate)
+library(ggmanh)
+library(edgeR)
+library(ggplot2)
+library(bsseq)
+library(rGREAT)
+```
+
+## 1.2 Directories
+```{r}
+datadir <- '~/file_workspace/Collaborative\ Projects/HPC_CEPI/ANALYSIS/Biomood/Again_BioMood_DataProcessing_FullScript/'
+```
+
+## 1.3 Load Data
+```{r}
+# Load QC'd methylation data (BS.obj) from script "02.Sample_QC.Rmd"
+load(file.path(datadir, "Final_QC_dataset.rda"))
+dim(Beta_nozero) # 48 samples, 7,589,804 CpGs
+
+# Load annotation reference map
+load(file.path(datadir, "BioMood_annotation_map.RData"))
+
+## subset annotation map for only non-zero variance CpGs
+nozero_cpgs <- rownames(Beta_nozero)
+annotation_map_nozero <- annotation_map[nozero_cpgs,]
+dim(annotation_map_nozero) # 7,589,804 CpGs
+
+# Load metabolite data
+BIOMOOD_GLYCSPC <- readr::read_csv(file.path(datadir, "BIOMOOD_GLYCSPC_260824.csv"))
+```
+
+### 1.3.1 Process metabolite data
+```{r}
+# remove sample IDs that failed QC
+samples_to_remove <- c("BioMood24", "BioMood35", "BioMood50", "BioMood39")
+
+metabolite_data <- BIOMOOD_GLYCSPC[!BIOMOOD_GLYCSPC$sourceID %in% samples_to_remove,]
+
+# extract 36w time point for each individual or latest time point available if no 36w
+metabolite_data <- metabolite_data %>%
+   dplyr::filter(
+    sampleTimePoint == 36 |
+    (sourceID == "BioMood9"  & sampleTimePoint == 28) |
+    (sourceID == "BioMood48" & sampleTimePoint == 20) |
+    (sourceID == "BioMood52" & sampleTimePoint == 20)
+  ) %>%
+  dplyr::rename(BioMood.ID = sourceID)
+
+dim(metabolite_data) # 47 BioMood IDs
+
+# add metabolite data to metadata and remove BioMood 16 (no metabolite data)
+metadata_merged <- metadata_pcs %>%
+  dplyr::left_join(metabolite_data, by = "BioMood.ID") %>%
+  filter(!(BioMood.ID == "BioMood16"))
+
+```
+
+###1.3.2 Update epigenetic data
+```{r}
+# Only 47 samples with metabolite data, original dataset has 48
+sample_list <- metadata_merged$BioMood.ID
+
+Beta_metab <- Beta_nozero[,colnames(Beta_nozero) %in% sample_list]
+dim(Beta_metab) # 47 samples, 7,589,804 CpGs
+M_metab <- M_nozero[,colnames(M_nozero) %in% sample_list]
+dim(M_metab) # same as Beta
+
+# Remove BioMood16 from BS object
+rem_samples <-  which(sapply(metadata_pcs$BioMood.ID, function(x) grepl("BioMood16", x)))
+BS.obj_metab <- BS.obj_nozero[,-rem_samples]
+
+bsseq::sampleNames(BS.obj_metab) <- 
+  pData(BS.obj_metab)$BioMood.ID
+
+```
+
+
+# 2.0 Data Checks
+
+## 2.1 Normality
+```{r}
+# GlycA 
+ggqqplot(metadata_merged$GlycA)
+ggdensity(metadata_merged$GlycA)
+
+# GlycB
+ggqqplot(metadata_merged$GlycB)
+ggdensity(metadata_merged$GlycB)
+
+# SPC1
+ggqqplot(metadata_merged$SPC1)
+ggdensity(metadata_merged$SPC1)
+
+## log SPC1
+ggqqplot(log(metadata_merged$SPC1))
+ggdensity(log(metadata_merged$SPC1))
+
+# SPC2
+ggqqplot(metadata_merged$SPC2)
+ggdensity(metadata_merged$SPC2)
+
+## log SPC2
+ggqqplot(log(metadata_merged$SPC2))
+ggdensity(log(metadata_merged$SPC2))
+
+# SPC3
+ggqqplot(metadata_merged$SPC3)
+ggdensity(metadata_merged$SPC3)
+
+## log SPC3
+ggqqplot(log(metadata_merged$SPC3))
+ggdensity(log(metadata_merged$SPC3))
+
+
+
+
+```
+
+
+
+### 2.1.1 Supplementary Figure 3
+```{r}
+# plot metabolite levels against each other
+par(mfrow = c(2, 2))
+plot(log(metadata_merged$SPC2), log(metadata_merged$SPC3), xlab = "Log(SPC2 levels)", ylab = "Log(SPC3 levels)")
+plot(log(metadata_merged$SPC1), log(metadata_merged$SPC2), xlab = "Log(SPC1 levels)", ylab = "Log(SPC2 levels)")
+plot(log(metadata_merged$SPC1), log(metadata_merged$SPC3), xlab = "Log(SPC1 levels)", ylab = "Log(SPC3 levels)")
+plot(metadata_merged$GlycA, metadata_merged$GlycB, xlab = "GlycA levels", ylab = "GlycB levels")
+```
+
+## 2.2 Correlation
+```{r}
+# GlycA vs GlycB
+cor.test(metadata_merged$GlycA, metadata_merged$GlycB, method="pearson")
+
+# SPC1 vs SPC2
+cor.test(log(metadata_merged$SPC1), log(metadata_merged$SPC2), method="pearson")
+
+# SPC2 vs SPC3
+cor.test(log(metadata_merged$SPC2), log(metadata_merged$SPC3), method="pearson")
+
+# SPC1 vs SPC3
+cor.test(log(metadata_merged$SPC1), log(metadata_merged$SPC3), method="pearson")
+
+```
+
+# 3.0 Hypothesis Testing
+
+## 3.1 GlycA EWAS
+```{r}
+# Multivariate model
+design_GlycA <- model.matrix(~ GlycA + as.factor(BioMood.group) + PC1 + PC2 + PC3 + PC4, data = metadata_merged)
+
+# Fit the linear model to M values
+M.fit_GlycA <- lmFit(M_metab, design_GlycA)
+M.fit2_GlycA <- eBayes(M.fit_GlycA)
+
+# Fit the linear model to Beta values
+B.fit_GlycA <- lmFit(Beta_metab, design_GlycA)
+B.fit2_GlycA <- eBayes(B.fit_GlycA)
+
+# Top Tables
+Mtt_GlycA <- topTable(M.fit2_GlycA, coef = "GlycA", number = Inf, sort.by = "none")
+Btt_GlycA <- topTable(B.fit2_GlycA, coef = "GlycA", number = Inf, sort.by = "none")
+
+# annotate results
+GlycA_annotated <- GRanges(annotation_map_nozero,
+                stat = Mtt_GlycA$t, 
+                diff = Btt_GlycA$logFC, 
+                ind.fdr = Mtt_GlycA$adj.P.Val, 
+                P.value = Mtt_GlycA$P.Value, 
+                is.sig = Mtt_GlycA$P.Value <= 1e-5,
+                Gene=annotation_map_nozero$annot_symbl,
+                Region = annotation_map_nozero$all_annotations)
+names(GlycA_annotated)=rownames(Mtt_GlycA)
+GlycA_annotated <- sort(GlycA_annotated)
+
+GlycA_annotated_df <- as.data.frame(GlycA_annotated)
+
+# filter for suggestive significant CpGs (p < 1e-5)
+GlycA_stats <-GlycA_annotated %>%
+  as_tibble() %>%
+  filter(is.sig == TRUE) %>%
+  arrange(P.value)
+
+GlycA_stats
+
+```
+### 3.1.1 Results - Supplementary Table 2C
+```{r}
+# annotate differentially methylated CpG results table with nearest TSS
+## convert chromosome format to NCBI
+GlycA_stats$seqnames <- paste0("chr", GlycA_stats$seqnames)
+
+## convert df to GRanges object
+GlycA_stats_gr <- GlycA_stats %>% GRanges()
+
+# annotate nearest TSS using rGREAT
+GlycA_job <- submitGreatJob(GlycA_stats_gr, species = "hg19")
+
+# get the distance to the nearest TSS
+GlycA_associations <- getRegionGeneAssociations(GlycA_job)
+
+GlycA_assoc_df <- as.data.frame(GlycA_associations)
+
+# tidy df to show only nearest TSS
+GlycA_clean_tss_df <- GlycA_assoc_df %>%
+  unnest(cols = c(annotated_genes, dist_to_TSS)) %>%
+  mutate(abs_dist = abs(dist_to_TSS)) %>%
+  group_by(seqnames, start, end) %>%
+  slice_min(abs_dist, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# final results
+final_GlycA_results_table <- GlycA_stats %>%
+  left_join(GlycA_clean_tss_df, by = c("seqnames", "start", "end"))
+
+# format for paper
+GlycA_table_format <- final_GlycA_results_table %>%
+  mutate(chr = gsub("chr", "", seqnames),
+         Genomic_Position = start,
+         EffectSize = format(diff, scientific = TRUE, digits = 3),
+         Nearest_Gene = paste0(annotated_genes, " (", dist_to_TSS, ")")) %>%
+  dplyr::select(chr, Genomic_Position, EffectSize, Nearest_Gene)
+
+GlycA_table_format
+```
+## 3.2 SPC1 EWAS
+```{r}
+# multivariate model
+design_SPC1 <- model.matrix(~ SPC1 + as.factor(BioMood.group) + PC1 + PC2 + PC3 + PC4, data = metadata_merged)
+
+# fit the linear model to M values
+M.fit_SPC1 <- lmFit(M_metab, design_SPC1)
+M.fit2_SPC1 <- eBayes(M.fit_SPC1)
+
+# fit the linear model to Beta values
+B.fit_SPC1 <- lmFit(Beta_metab, design_SPC1)
+B.fit2_SPC1 <- eBayes(B.fit_SPC1)
+
+# top tables
+Mtt_SPC1 <- topTable(M.fit2_SPC1, coef = "SPC1", number = Inf, sort.by = "none")
+Btt_SPC1 <- topTable(B.fit2_SPC1, coef = "SPC1", number = Inf, sort.by = "none")
+
+# annotate
+SPC1_annotated <- GRanges(annotation_map_nozero,
+                stat = Mtt_SPC1$t, 
+                diff = Btt_SPC1$logFC, 
+                ind.fdr = Mtt_SPC1$adj.P.Val, 
+                P.Value = Mtt_SPC1$P.Value, 
+                is.sig = Mtt_SPC1$P.Value <= 1e-5,
+                Gene=annotation_map_nozero$annot_symbl,
+                Region = annotation_map_nozero)
+names(SPC1_annotated)=rownames(Mtt_SPC1)
+
+# filter for suggestive significant CpGs (p < 1e-5)
+SPC1_stats <-SPC1_annotated %>%
+  as_tibble() %>%
+  filter(is.sig == TRUE) %>%
+  arrange(P.Value)
+
+SPC1_stats
+```
+### 3.2.1 Results - Figure 4A
+```{r}
+# manhattan plot of SPC1 results
+
+## create dataframe for plotting
+SPC1_data <- data.frame(
+  strsplit2(rownames(Mtt_SPC1), ":"), Mtt_SPC1) %>% 
+  dplyr::rename('chromosome' = 'X1', 'position' = 'X2') %>%
+  dplyr::mutate(position = as.numeric(position),
+               chromosome = factor(chromosome, levels = c(1:22, "X"))) %>%
+  dplyr::filter(!(chromosome == "Y")) %>%
+  dplyr::select(chromosome, position, P.Value)
+
+
+# color by significance, highlighting the genome-wide significant CpG
+SPC1_data$color <- ifelse(as.numeric(SPC1_data$chromosome) %% 2 == 0, "Even", "Odd")
+SPC1_data$color[SPC1_data$chromosome == "X"] <- "Odd"
+SPC1_data$color[SPC1_data$P.Value < 1e-5] <- "Significant"
+SPC1_data$color[SPC1_data$position == 11889304] <- "GWSig"
+
+# label LPIN
+SPC1_data$label <- ""
+SPC1_data$label[SPC1_data$position == 11889304] <- "LPIN1"
+
+SPC1_highlight_colormap <- c(
+  "Odd"         = "#6caeff", 
+  "Even"        = "#2b5d9b", 
+  "Significant" = "#FF8C00",
+  "GWSig" = "#D73027"
+)
+
+SPC1_mhplot <- manhattan_plot(
+  x           = SPC1_data,
+  pval.colname = "P.Value",
+  chr.colname  = "chromosome",
+  pos.colname  = "position",
+  y.label      = "-log10(P value)",
+  highlight.colname = "color", highlight.col = SPC1_highlight_colormap, color.by.highlight = TRUE, label.colname = "label",
+  label.font.size = 3
+) +
+  theme(
+    plot.title       = element_text(size = 22, face = "bold"),
+    axis.title.x     = element_text(size = 12),
+    axis.title.y     = element_text(size = 12),
+    axis.text.x      = element_text(size = 10),
+    axis.text.y      = element_text(size = 10)
+  ) 
+
+SPC1_mhplot
+```
+
+### 3.2.2 Results - Figure 4B
+```{r}
+# Plot SPC1 levels vs LPIN 1 methylation
+
+## extra LPIN1 Beta values 
+LPIN1_Betas <- Beta_metab["2:11889304",] %>% as.data.frame() 
+
+LPIN1_Betas <- LPIN1_Betas %>% t()
+
+## Add SPC1 and group data
+SPC1_meta <- metadata_merged %>%
+  dplyr::select(BioMood.ID, BioMood.group, SPC1)
+
+LPIN1_SPC1_data <- LPIN1_Betas %>% cbind(SPC1_meta)
+colnames(LPIN1_SPC1_data)[1] <- "Beta"
+
+## Label group as high or low
+LPIN1_SPC1_data$BioMood.group = ifelse(LPIN1_SPC1_data$BioMood.group == 0, "Low", "High")
+
+## Plot
+SPC1_conc_plot <- ggplot(LPIN1_SPC1_data, aes(SPC1, Beta, colour = factor(BioMood.group))) +
+  geom_point() +
+  geom_smooth(method='lm' , se=FALSE) +
+  stat_cor(aes(label = after_stat(r.label)), size = 3, label.x = 19000,
+           label.y = c(0.31, 0.27)) +
+  stat_regline_equation(aes(label = after_stat(eq.label)), size = 3, label.x = 19000,
+                        label.y = c(0.33, 0.29)) +
+  theme_bw() +
+  xlab("SPC1 (Relative Intensity)") +
+  ylab("% Methylation") +
+  labs(color = "MDA") +
+  theme(axis.title.x     = element_text(size = 12),
+    axis.title.y     = element_text(size = 12),
+    axis.text.x      = element_text(size = 10),
+    axis.text.y      = element_text(size = 10)
+    )
+
+SPC1_conc_plot
+```
+
+### 3.2.3 Results - Supplementary Table 2D
+```{r}
+# annotate with nearest TSS and format for final table
+
+## convert chromosome format to NCBI
+SPC1_stats$seqnames <- paste0("chr", SPC1_stats$seqnames)
+
+## convert df to GRanges
+SPC1_stats_gr <- SPC1_stats %>% GRanges()
+
+## annotate nearest TSS using rGREAT
+SPC1_job <- submitGreatJob(SPC1_stats_gr, species = "hg19")
+
+# get the distance to the nearest TSS
+SPC1_associations <- getRegionGeneAssociations(SPC1_job)
+
+SPC1_assoc_df <- as.data.frame(SPC1_associations)
+
+# tidy df to show only nearest TSS
+SPC1_clean_tss_df <- SPC1_assoc_df %>%
+    unnest(cols = c(annotated_genes, dist_to_TSS)) %>%
+    mutate(abs_dist = abs(dist_to_TSS)) %>%
+    group_by(seqnames, start, end) %>%
+    slice_min(abs_dist, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# final table
+final_SPC1_results_table <- SPC1_stats %>%
+  left_join(SPC1_clean_tss_df, by = c("seqnames", "start", "end"))
+
+# format for paper
+SPC1_table_format <- final_SPC1_results_table %>%
+  mutate(chr = gsub("chr", "", seqnames),
+         Genomic_Position = start,
+         EffectSize = format(diff, scientific = TRUE, digits = 3),
+         Nearest_Gene = paste0(annotated_genes, " (", dist_to_TSS, ")")) %>%
+  dplyr::select(chr, Genomic_Position, EffectSize, Nearest_Gene)
+
+SPC1_table_format
+```
+
+## 3.3 SPC3 EWAS
+```{r}
+design_SPC3 <- model.matrix(~ SPC3 + as.factor(BioMood.group) + PC1 + PC2 + PC3 + PC4, data = metadata_merged)
+
+# fit the linear model to M values
+M.fit_SPC3 <- lmFit(M_metab, design_SPC3)
+M.fit2_SPC3 <- eBayes(M.fit_SPC3)
+
+# fit the linear model to Beta values
+B.fit_SPC3 <- lmFit(Beta_metab, design_SPC3)
+B.fit2_SPC3 <- eBayes(B.fit_SPC3)
+
+# top tables
+Mtt_SPC3 <- topTable(M.fit2_SPC3, coef = "SPC3", number = Inf, sort.by = "none")
+Btt_SPC3 <- topTable(B.fit2_SPC3, coef = "SPC3", number = Inf, sort.by = "none")
+
+
+# annotate
+SPC3_annotated <- GRanges(annotation_map_nozero,
+                stat = Mtt_SPC3$t, 
+                diff = Btt_SPC3$logFC, 
+                ind.fdr = Mtt_SPC3$adj.P.Val, 
+                P.Value = Mtt_SPC3$P.Value, 
+                is.sig = Mtt_SPC3$P.Value <= 1e-5,
+                Gene=annotation_map_nozero$annot_symbl,
+                Region = annotation_map_nozero$all_annotations)
+names(SPC3_annotated)=rownames(Mtt_SPC3)
+
+# filter for suggestive significant CpGs (p < 1e-5)
+SPC3_stats <-SPC3_annotated %>%
+  as_tibble() %>%
+  filter(is.sig == TRUE) %>%
+  arrange(P.Value)
+
+SPC3_stats
+```
+
+### 3.3.1 Results - Supplementary Table 2E
+```{r}
+# annotate with nearest TSS and format for final table
+
+## convert chromosome format to NCBI
+SPC3_stats$seqnames <- paste0("chr", SPC3_stats$seqnames)
+
+## convert to GRanges
+SPC3_stats_gr <- SPC3_stats %>% GRanges()
+
+## annotate nearest TSS using rGREAT
+SPC3_job <- submitGreatJob(SPC3_stats_gr, species = "hg19")
+
+## get the distance to the nearest TSS
+SPC3_associations <- getRegionGeneAssociations(SPC3_job)
+
+SPC3_assoc_df <- as.data.frame(SPC3_associations)
+
+## tidy up to show nearest TSS
+SPC3_clean_tss_df <- SPC3_assoc_df %>%
+    unnest(cols = c(annotated_genes, dist_to_TSS)) %>%
+    mutate(abs_dist = abs(dist_to_TSS)) %>%
+    group_by(seqnames, start, end) %>%
+    slice_min(abs_dist, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+## final table
+final_SPC3_results_table <- SPC3_stats %>%
+  left_join(SPC3_clean_tss_df, by = c("seqnames", "start", "end"))
+
+## format for paper
+SPC3_table_format <- final_SPC3_results_table %>%
+  mutate(Chr = gsub("chr", "", seqnames),
+         Genomic_Position = start,
+         EffectSize = format(diff, scientific = TRUE, digits = 3),
+         Nearest_Gene = paste0(annotated_genes, " (", dist_to_TSS, ")")) %>%
+  dplyr::select(Chr, Genomic_Position, EffectSize, Nearest_Gene)
+
+SPC3_table_format
+```
+

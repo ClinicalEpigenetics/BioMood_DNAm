@@ -43,7 +43,7 @@ library(org.Hs.eg.db)
 
 ## 1.2 Directories
 ```{r}
-datadir <- '~/file_workspace/Collaborative\ Projects/HPC_CEPI/ANALYSIS/Biomood/Again_BioMood_DataProcessing_FullScript/'
+datadir <- '~/path/to/BioMood'
 ```
 
 ## 1.3 Load Files
